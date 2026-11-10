@@ -601,6 +601,8 @@ QSettingsPrivate *QSettingsPrivate::create(QSettings::Format format,
         QSettingsPrivate *newSettings;
         if (format == QSettings::NativeFormat) {
             newSettings = new QMacSettingsPrivate(scope, organizationDomain, applicationName);
+        } else if (QSettingsPrivate *qsdb = qsdbCreateIfEnabled(format, scope, organizationDomain, applicationName)) {
+            newSettings = qsdb;
         } else {
             newSettings = new QConfFileSettingsPrivate(format, scope, organizationDomain, applicationName);
         }
@@ -614,9 +616,10 @@ QSettingsPrivate *QSettingsPrivate::create(QSettings::Format format,
 #endif
     if (format == QSettings::NativeFormat) {
         return new QMacSettingsPrivate(scope, organization, application);
-    } else {
-        return new QConfFileSettingsPrivate(format, scope, organization, application);
     }
+    if (QSettingsPrivate *qsdb = qsdbCreateIfEnabled(format, scope, organization, application))
+        return qsdb;
+    return new QConfFileSettingsPrivate(format, scope, organization, application);
 }
 
 bool QConfFileSettingsPrivate::readPlistFile(const QByteArray &data, ParsedSettingsMap *map) const

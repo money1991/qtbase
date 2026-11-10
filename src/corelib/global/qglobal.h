@@ -140,6 +140,8 @@
 #ifdef __cplusplus
 
 #include <algorithm>
+/* g++ 13 does not guarantee <limits> via <algorithm>; Qt 5.12 headers use std::numeric_limits. */
+#include <limits>
 
 #if !defined(QT_NAMESPACE) || defined(Q_MOC_RUN) /* user namespace */
 
