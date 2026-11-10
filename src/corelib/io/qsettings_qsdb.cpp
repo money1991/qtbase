@@ -20,6 +20,8 @@ QT_END_NAMESPACE
 
 #include "qsdb.h"
 
+#include <stdlib.h>
+
 #include <QtCore/qdatastream.h>
 #include <QtCore/qdir.h>
 #include <QtCore/qfile.h>
@@ -308,9 +310,21 @@ public:
         const QByteArray kb = keyBytes(key);
         if (kb.size() > QSDB_MAX_KEY_BYTES)
             return false;
+        if (!value) {
+            const int rc = qsdb_contains(shared->snap, kb.constData(), size_t(kb.size()));
+            if (rc == QSDB_NOT_FOUND)
+                return false;
+            if (rc != QSDB_OK) {
+                setStatus(rc == QSDB_CORRUPT ? QSettings::FormatError : QSettings::AccessError);
+                return false;
+            }
+            return true;
+        }
         uint32_t tag = 0;
+        void *mem = 0;
         size_t len = 0;
-        int rc = qsdb_get(shared->snap, kb.constData(), size_t(kb.size()), &tag, 0, 0, &len, 0);
+        const int rc = qsdb_get_alloc(shared->snap, kb.constData(), size_t(kb.size()),
+                                      &tag, &mem, &len);
         if (rc == QSDB_NOT_FOUND)
             return false;
         if (rc != QSDB_OK) {
@@ -318,23 +332,15 @@ public:
             return false;
         }
         if (len > 0x7fffffffU) {
+            free(mem);
             setStatus(QSettings::AccessError);
             return false;
         }
         QByteArray payload;
-        if (len) {
-            payload.resize(int(len));
-            size_t got = 0;
-            rc = qsdb_get(shared->snap, kb.constData(), size_t(kb.size()), &tag,
-                          payload.data(), payload.size(), &got, 0);
-            if (rc != QSDB_OK) {
-                setStatus(QSettings::AccessError);
-                return false;
-            }
-            payload.resize(int(got));
-        }
-        if (value)
-            *value = decodeVariant(tag, payload, iniCodec);
+        if (len)
+            payload = QByteArray(static_cast<const char *>(mem), int(len));
+        free(mem);
+        *value = decodeVariant(tag, payload, iniCodec);
         return true;
     }
 
@@ -401,19 +407,44 @@ public:
             QMutexLocker lock(&shared->mu);
             if (!(i == 0 && shared->cleared) && shared->snap) {
                 struct Acc {
+                    QString prefix;
                     QStringList keys;
-                } acc;
-                struct Local {
                     static int cb(const void *key, size_t keyLen, uint32_t, uint64_t, void *user)
                     {
                         Acc *a = static_cast<Acc *>(user);
-                        a->keys.append(keyFromBytes(key, keyLen));
+                        const QString full = keyFromBytes(key, keyLen);
+                        if (!a->prefix.isEmpty() && !full.startsWith(a->prefix)) {
+                            if (full > a->prefix)
+                                return 1;
+                            return 0;
+                        }
+                        a->keys.append(full);
                         return 0;
                     }
-                };
+                } acc;
+                acc.prefix = prefix;
                 const QByteArray start = prefix.isEmpty() ? QByteArray() : keyBytes(prefix);
-                qsdb_scan(shared->snap, start.isEmpty() ? 0 : start.constData(),
-                          size_t(start.size()), Local::cb, &acc);
+                QByteArray end;
+                if (!start.isEmpty() && start.size() >= 2 && (start.size() % 2) == 0) {
+                    end = start;
+                    for (int u = end.size() - 2; u >= 0; u -= 2) {
+                        unsigned c = uchar(end[u]) | (unsigned(uchar(end[u + 1])) << 8);
+                        if (c != 0xffffu) {
+                            ++c;
+                            end[u] = char(c & 0xff);
+                            end[u + 1] = char((c >> 8) & 0xff);
+                            break;
+                        }
+                        end[u] = 0;
+                        end[u + 1] = 0;
+                        if (u == 0)
+                            end.clear();
+                    }
+                }
+                qsdb_scan_range(shared->snap, start.isEmpty() ? 0 : start.constData(),
+                                size_t(start.size()),
+                                end.isEmpty() ? 0 : end.constData(), size_t(end.size()),
+                                Acc::cb, &acc);
                 for (int k = 0; k < acc.keys.size(); ++k) {
                     const QString &full = acc.keys.at(k);
                     if (!prefix.isEmpty() && full != prefix && !full.startsWith(prefix))

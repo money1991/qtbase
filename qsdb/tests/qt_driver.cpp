@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <time.h>
+#include <unistd.h>
 #include <vector>
 
 static void onAbort(int)
@@ -36,16 +37,19 @@ static uint64_t mono()
 static void summarize(const char *backend, const char *scenario, const std::vector<uint64_t> &samples,
                       FILE *raw, QTextStream &summary)
 {
+    if (samples.empty())
+        return;
     std::vector<uint64_t> s = samples;
     std::sort(s.begin(), s.end());
     const int n = int(s.size());
+    const uint64_t first = samples[0];
     const uint64_t med = s[n / 2];
     const int p95i = std::max(0, (n - 1) * 95 / 100);
     const uint64_t p95 = s[size_t(p95i)];
-    const double us = double(med) / 1000.0;
     const double ops = med ? 1e9 / double(med) : 0;
-    summary << backend << "," << scenario << ",us," << us << "," << (double(p95) / 1000.0)
-            << "," << ops << "," << n << "\n";
+    summary << backend << "," << scenario << "," << (double(first) / 1000.0) << ","
+            << (double(med) / 1000.0) << "," << (double(p95) / 1000.0) << ","
+            << ops << "," << n << "\n";
     for (int i = 0; i < n; ++i)
         fprintf(raw, "%s,%s,%d,%llu\n", backend, scenario, i, (unsigned long long)samples[size_t(i)]);
 }
@@ -231,158 +235,316 @@ static QSettings *openBackend(const QString &path, bool qsdb)
     return new QSettings(path, QSettings::IniFormat);
 }
 
+static void restoreFile(const QString &pristine, const QString &path)
+{
+    QFile::remove(path);
+    if (!QFile::copy(pristine, path))
+        fprintf(stderr, "restore failed\n");
+}
+
+static bool fieldNs(const QString &text, const char *name, uint64_t *out)
+{
+    const QString needle = QLatin1String(name) + QLatin1Char('=');
+    const int at = text.indexOf(needle);
+    if (at < 0)
+        return false;
+    bool ok = false;
+    *out = text.mid(at + needle.size()).section(QLatin1Char('\n'), 0, 0).toULongLong(&ok);
+    return ok;
+}
+
+static int freshOne(const QString &kind, const QString &path, const QString &key)
+{
+    const bool qsdb = kind == QLatin1String("qsdb");
+    const uint64_t t0 = mono();
+    QSettings *s = openBackend(path, qsdb);
+    const uint64_t t1 = mono();
+    const QVariant first = s->value(key);
+    const uint64_t t2 = mono();
+    const QVariant second = s->value(key);
+    const uint64_t t3 = mono();
+    s->contains(QStringLiteral("zz-missing-bench"));
+    const uint64_t t4 = mono();
+    s->contains(key);
+    const uint64_t t5 = mono();
+    const int status = int(s->status());
+    delete s;
+    printf("construct_ns=%llu\nfirst_value_ns=%llu\nsecond_value_ns=%llu\nmiss_ns=%llu\ncontains_ns=%llu\nstatus=%d\nvalid=%d\n",
+           (unsigned long long)(t1 - t0), (unsigned long long)(t2 - t1),
+           (unsigned long long)(t3 - t2), (unsigned long long)(t4 - t3),
+           (unsigned long long)(t5 - t4), status, int(first.isValid() && second.isValid()));
+    return status == int(QSettings::NoError) ? 0 : 2;
+}
+
+static int runFresh(const QString &exe, const QString &kind, const QString &path, const QString &key,
+                    std::vector<uint64_t> *construct, std::vector<uint64_t> *first,
+                    std::vector<uint64_t> *second, std::vector<uint64_t> *miss,
+                    std::vector<uint64_t> *contains)
+{
+    for (int i = 0; i < 21; ++i) {
+        QProcess child;
+        child.start(exe, QStringList() << QStringLiteral("fresh-one") << kind << path << key);
+        if (!child.waitForFinished(120000) || child.exitCode() != 0)
+            return 2;
+        const QString text = QString::fromUtf8(child.readAllStandardOutput());
+        uint64_t a = 0, b = 0, c = 0, d = 0, e = 0;
+        if (!fieldNs(text, "construct_ns", &a) || !fieldNs(text, "first_value_ns", &b)
+            || !fieldNs(text, "second_value_ns", &c) || !fieldNs(text, "miss_ns", &d)
+            || !fieldNs(text, "contains_ns", &e))
+            return 3;
+        construct->push_back(a);
+        first->push_back(b);
+        second->push_back(c);
+        miss->push_back(d);
+        contains->push_back(e);
+    }
+    return 0;
+}
+
 static int bench(const QString &iniPath, const QString &dbPath, const QString &outDir)
 {
     QDir().mkpath(outDir);
     QFile rawFile(outDir + QStringLiteral("/samples.csv"));
     if (!rawFile.open(QIODevice::WriteOnly | QIODevice::Truncate))
         return 2;
-    FILE *raw = fdopen(rawFile.handle(), "w");
+    FILE *raw = fdopen(dup(rawFile.handle()), "w");
     fprintf(raw, "backend,scenario,trial,ns\n");
     QFile sumFile(outDir + QStringLiteral("/summary.csv"));
     if (!sumFile.open(QIODevice::WriteOnly | QIODevice::Truncate))
         return 3;
     QTextStream summary(&sumFile);
-    summary << "backend,scenario,median_unit,median_us,p95_us,ops_per_s,samples\n";
+    summary << "backend,scenario,first_us,median_us,p95_us,ops_per_s,samples\n";
+    QFile noteFile(outDir + QStringLiteral("/timing.txt"));
+    if (noteFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        QTextStream note(&noteFile);
+        note << "clock=CLOCK_MONOTONIC\n";
+        note << "samples=21 for one-shot scenarios; hot_get/miss/contains are 21*200 individual calls\n";
+        note << "median=sorted[n/2]\n";
+        note << "p95=sorted[(n-1)*95/100]\n";
+        note << "first_us=sample 0 before sorting, so it is the first call in that process\n";
+        note << "fresh_*=new process, no in-process QSettings cache. OS page cache is warm. This is not a cold-disk number.\n";
+        note << "reuse_construct=second QSettings on the same path while the first object is still alive\n";
+        note << "hot_*=calls on that already-open object, after one untimed value() warmup\n";
+        note << "pure_set_existing=setValue only. rmw_set_existing=value()+setValue of the same string\n";
+        note << "open/restore is outside remove, clear, and sync timers\n";
+        note << "import parse is not included in any get number\n";
+    }
 
     qunsetenv("QSDB_BACKEND");
-    QSettings ini(iniPath, QSettings::IniFormat);
-    const QStringList keys = ini.allKeys();
+    QStringList keys;
+    QString group;
+    {
+        QSettings ini(iniPath, QSettings::IniFormat);
+        keys = ini.allKeys();
+        const QStringList groups = ini.childGroups();
+        if (!groups.isEmpty())
+            group = groups.at(0);
+    }
     if (keys.isEmpty())
         return 4;
-    QStringList groups = ini.childGroups();
-    const int trials = 21;
-    unsigned seed = 20261110u;
+    const QString hitKey = keys.at(keys.size() / 2);
+    const QString exe = QCoreApplication::applicationFilePath();
 
     struct Target {
         const char *name;
         QString path;
         bool qsdb;
     } targets[2] = {
-        {"ini", iniPath, false},
-        {"qsdb", dbPath, true}
+        {"ini", iniPath + QStringLiteral(".bench"), false},
+        {"qsdb", dbPath + QStringLiteral(".bench"), true}
     };
+    QFile::remove(targets[0].path);
+    QFile::remove(targets[1].path);
+    if (!QFile::copy(iniPath, targets[0].path) || !QFile::copy(dbPath, targets[1].path))
+        return 5;
 
     for (int t = 0; t < 2; ++t) {
         const QString pristine = targets[t].path + QStringLiteral(".pristine");
         QFile::remove(pristine);
         QFile::copy(targets[t].path, pristine);
-        std::vector<uint64_t> openNs, firstNs, hitNs, missNs, containsNs;
-        std::vector<uint64_t> setOldNs, setNewNs, syncOneNs, batchSetNs, batchSyncNs;
-        std::vector<uint64_t> childKeysNs, childGroupsNs, allKeysNs, syncNoopNs;
-        QString hitKey = keys.at(seed % keys.size());
-        for (int i = 0; i < trials; ++i) {
-            seed = seed * 1664525u + 1013904223u;
-            hitKey = keys.at(int(seed % unsigned(keys.size())));
-            const uint64_t t0 = mono();
-            QSettings *s = openBackend(targets[t].path, targets[t].qsdb);
-            const uint64_t t1 = mono();
-            QVariant v = s->value(hitKey);
-            const uint64_t t2 = mono();
-            openNs.push_back(t1 - t0);
-            firstNs.push_back(t2 - t1);
-            Q_UNUSED(v);
-            uint64_t accHit = 0, accMiss = 0, accCon = 0;
-            for (int n = 0; n < 200; ++n) {
-                seed = seed * 1664525u + 1013904223u;
-                const QString k = keys.at(int(seed % unsigned(keys.size())));
-                uint64_t a = mono();
-                s->value(k);
-                uint64_t b = mono();
-                s->contains(QStringLiteral("zz-missing-bench"));
-                uint64_t c = mono();
-                s->contains(k);
-                uint64_t d = mono();
-                accHit += b - a;
-                accMiss += c - b;
-                accCon += d - c;
-            }
-            hitNs.push_back(accHit / 200);
-            missNs.push_back(accMiss / 200);
-            containsNs.push_back(accCon / 200);
 
-            const uint64_t s0 = mono();
-            s->setValue(hitKey, s->value(hitKey).toString() + QString());
-            const uint64_t s1 = mono();
-            s->setValue(QStringLiteral("bench-new-single"), QStringLiteral("x"));
-            const uint64_t s2 = mono();
+        std::vector<uint64_t> freshOpen, freshFirst, freshSecond, freshMiss, freshContains;
+        const int fr = runFresh(exe, targets[t].qsdb ? QStringLiteral("qsdb") : QStringLiteral("ini"),
+                                targets[t].path, hitKey, &freshOpen, &freshFirst, &freshSecond,
+                                &freshMiss, &freshContains);
+        if (fr)
+            return 10 + fr;
+        summarize(targets[t].name, "fresh_construct", freshOpen, raw, summary);
+        summarize(targets[t].name, "fresh_first_value", freshFirst, raw, summary);
+        summarize(targets[t].name, "fresh_second_value", freshSecond, raw, summary);
+        summarize(targets[t].name, "fresh_miss", freshMiss, raw, summary);
+        summarize(targets[t].name, "fresh_contains", freshContains, raw, summary);
+
+        QSettings *live = openBackend(targets[t].path, targets[t].qsdb);
+        std::vector<uint64_t> reuse;
+        for (int i = 0; i < 21; ++i) {
+            const uint64_t a = mono();
+            QSettings *extra = openBackend(targets[t].path, targets[t].qsdb);
+            const uint64_t b = mono();
+            delete extra;
+            reuse.push_back(b - a);
+        }
+        summarize(targets[t].name, "reuse_construct", reuse, raw, summary);
+        live->value(hitKey);
+
+        std::vector<uint64_t> hit, miss, contains;
+        unsigned seed = 20261110u;
+        for (int n = 0; n < 21 * 200; ++n) {
+            seed = seed * 1664525u + 1013904223u;
+            const QString k = keys.at(int(seed % unsigned(keys.size())));
+            const uint64_t a = mono();
+            live->value(k);
+            const uint64_t b = mono();
+            live->contains(QStringLiteral("zz-missing-bench"));
+            const uint64_t c = mono();
+            live->contains(k);
+            const uint64_t d = mono();
+            hit.push_back(b - a);
+            miss.push_back(c - b);
+            contains.push_back(d - c);
+        }
+        summarize(targets[t].name, "hot_get_hit", hit, raw, summary);
+        summarize(targets[t].name, "hot_get_miss", miss, raw, summary);
+        summarize(targets[t].name, "hot_contains_hit", contains, raw, summary);
+
+        std::vector<uint64_t> childKeys, childGroups, allKeys, syncNoop;
+        for (int i = 0; i < 21; ++i) {
+            uint64_t a = mono();
+            live->childKeys();
+            uint64_t b = mono();
+            live->childGroups();
+            uint64_t c = mono();
+            live->allKeys();
+            uint64_t d = mono();
+            live->sync();
+            uint64_t e = mono();
+            childKeys.push_back(b - a);
+            childGroups.push_back(c - b);
+            allKeys.push_back(d - c);
+            syncNoop.push_back(e - d);
+        }
+        summarize(targets[t].name, "childKeys", childKeys, raw, summary);
+        summarize(targets[t].name, "childGroups", childGroups, raw, summary);
+        summarize(targets[t].name, "allKeys", allKeys, raw, summary);
+        summarize(targets[t].name, "sync_noop", syncNoop, raw, summary);
+
+        std::vector<uint64_t> pureSet, rmw, pureNew;
+        for (int i = 0; i < 21; ++i) {
+            const uint64_t a = mono();
+            live->setValue(hitKey, QStringLiteral("bench-pure"));
+            const uint64_t b = mono();
+            pureSet.push_back(b - a);
+            const uint64_t c = mono();
+            const QString cur = live->value(hitKey).toString();
+            live->setValue(hitKey, cur);
+            const uint64_t d = mono();
+            rmw.push_back(d - c);
+            const uint64_t e = mono();
+            live->setValue(QStringLiteral("bench-new-%1").arg(i), i);
+            const uint64_t f = mono();
+            pureNew.push_back(f - e);
+        }
+        summarize(targets[t].name, "pure_set_existing", pureSet, raw, summary);
+        summarize(targets[t].name, "rmw_set_existing", rmw, raw, summary);
+        summarize(targets[t].name, "pure_set_new", pureNew, raw, summary);
+        delete live;
+
+        std::vector<uint64_t> oneSet, oneSync, batchEach, batchSync;
+        std::vector<uint64_t> rmKey, rmGroup, clearNs;
+        qint64 sizeOne = 0, sizeGroup = 0, sizeClear = 0;
+        for (int i = 0; i < 21; ++i) {
+            restoreFile(pristine, targets[t].path);
+            QSettings *s = openBackend(targets[t].path, targets[t].qsdb);
+            const uint64_t a = mono();
+            s->setValue(QStringLiteral("bench-sync-one"), QStringLiteral("1"));
+            const uint64_t b = mono();
             s->sync();
-            const uint64_t s3 = mono();
-            setOldNs.push_back(s1 - s0);
-            setNewNs.push_back(s2 - s1);
-            syncOneNs.push_back(s3 - s2);
-            const uint64_t b0 = mono();
+            const uint64_t c = mono();
+            oneSet.push_back(b - a);
+            oneSync.push_back(c - b);
+            if (i == 0)
+                sizeOne = QFileInfo(targets[t].path).size();
+            delete s;
+
+            restoreFile(pristine, targets[t].path);
+            s = openBackend(targets[t].path, targets[t].qsdb);
+            const uint64_t d0 = mono();
             for (int n = 0; n < 50; ++n)
                 s->setValue(QStringLiteral("bench-batch-%1").arg(n), n);
-            const uint64_t b1 = mono();
+            const uint64_t d1 = mono();
             s->sync();
-            const uint64_t b2 = mono();
-            batchSetNs.push_back((b1 - b0) / 50);
-            batchSyncNs.push_back(b2 - b1);
-            const uint64_t c0 = mono();
-            s->childKeys();
-            const uint64_t c1 = mono();
-            s->childGroups();
-            const uint64_t c2 = mono();
-            s->allKeys();
-            const uint64_t c3 = mono();
-            s->sync();
-            const uint64_t c4 = mono();
-            childKeysNs.push_back(c1 - c0);
-            childGroupsNs.push_back(c2 - c1);
-            allKeysNs.push_back(c3 - c2);
-            syncNoopNs.push_back(c4 - c3);
+            const uint64_t d2 = mono();
+            batchEach.push_back((d1 - d0) / 50);
+            batchSync.push_back(d2 - d1);
             delete s;
-        }
-        summarize(targets[t].name, "construct", openNs, raw, summary);
-        summarize(targets[t].name, "first_value", firstNs, raw, summary);
-        summarize(targets[t].name, "hot_get_hit", hitNs, raw, summary);
-        summarize(targets[t].name, "hot_get_miss", missNs, raw, summary);
-        summarize(targets[t].name, "hot_contains_hit", containsNs, raw, summary);
-        summarize(targets[t].name, "set_existing_uncommitted", setOldNs, raw, summary);
-        summarize(targets[t].name, "set_new_uncommitted", setNewNs, raw, summary);
-        summarize(targets[t].name, "sync_after_two_sets", syncOneNs, raw, summary);
-        summarize(targets[t].name, "set_batch50_each", batchSetNs, raw, summary);
-        summarize(targets[t].name, "sync_batch50", batchSyncNs, raw, summary);
-        summarize(targets[t].name, "childKeys", childKeysNs, raw, summary);
-        summarize(targets[t].name, "childGroups", childGroupsNs, raw, summary);
-        summarize(targets[t].name, "allKeys", allKeysNs, raw, summary);
-        summarize(targets[t].name, "sync_noop", syncNoopNs, raw, summary);
 
-        std::vector<uint64_t> rmKey, rmGroup, clearNs;
-        for (int i = 0; i < trials; ++i) {
-            QSettings *s = openBackend(targets[t].path, targets[t].qsdb);
-            const QString victim = keys.at(i % keys.size());
-            uint64_t a = mono();
-            s->remove(victim);
-            uint64_t b = mono();
+            restoreFile(pristine, targets[t].path);
+            s = openBackend(targets[t].path, targets[t].qsdb);
+            const uint64_t r0 = mono();
+            s->remove(keys.at(i % keys.size()));
             s->sync();
-            uint64_t c = mono();
-            rmKey.push_back(c - a);
-            Q_UNUSED(b);
-            const QStringList g = s->childGroups();
-            if (!g.isEmpty()) {
-                a = mono();
-                s->remove(g.at(0));
-                b = mono();
+            const uint64_t r1 = mono();
+            rmKey.push_back(r1 - r0);
+            if (!group.isEmpty()) {
+                const uint64_t g0 = mono();
+                s->remove(group);
                 s->sync();
-                c = mono();
-                rmGroup.push_back(c - a);
+                const uint64_t g1 = mono();
+                rmGroup.push_back(g1 - g0);
+                if (i == 0)
+                    sizeGroup = QFileInfo(targets[t].path).size();
             }
-            a = mono();
+            const uint64_t c0 = mono();
             s->clear();
-            b = mono();
             s->sync();
-            c = mono();
-            clearNs.push_back(c - a);
+            const uint64_t c1 = mono();
+            clearNs.push_back(c1 - c0);
+            if (i == 0)
+                sizeClear = QFileInfo(targets[t].path).size();
             delete s;
-            QFile::remove(targets[t].path);
-            QFile::copy(pristine, targets[t].path);
         }
+        summarize(targets[t].name, "pure_set_new_isolated", oneSet, raw, summary);
+        summarize(targets[t].name, "sync_after_one_set", oneSync, raw, summary);
+        summarize(targets[t].name, "set_batch50_each", batchEach, raw, summary);
+        summarize(targets[t].name, "sync_batch50", batchSync, raw, summary);
         summarize(targets[t].name, "remove_one_key_and_sync", rmKey, raw, summary);
         if (!rmGroup.empty())
             summarize(targets[t].name, "remove_one_group_and_sync", rmGroup, raw, summary);
         summarize(targets[t].name, "clear_and_sync", clearNs, raw, summary);
+
+        std::vector<uint64_t> externalSync;
+        int externalFail = 0;
+        for (int i = 0; i < 21; ++i) {
+            restoreFile(pristine, targets[t].path);
+            if (targets[t].qsdb)
+                qputenv("QSDB_BACKEND", "1");
+            else
+                qunsetenv("QSDB_BACKEND");
+            QSettings parent(targets[t].path, QSettings::IniFormat);
+            const bool seenBefore = parent.contains(QStringLiteral("k-external-probe"));
+            QProcess child;
+            child.start(exe, QStringList() << QStringLiteral("external-writer")
+                        << (targets[t].qsdb ? QStringLiteral("qsdb") : QStringLiteral("ini"))
+                        << targets[t].path);
+            if (!child.waitForFinished(60000) || child.exitCode() != 0)
+                return 30;
+            const bool seenMid = parent.contains(QStringLiteral("k-external-probe"));
+            const uint64_t t0 = mono();
+            parent.sync();
+            const uint64_t t1 = mono();
+            const bool seenAfter = parent.value(QStringLiteral("k-external-probe")).toString()
+                    == QLatin1String("from-other-process");
+            externalSync.push_back(t1 - t0);
+            if (seenBefore || seenMid || !seenAfter)
+                externalFail++;
+        }
+        summarize(targets[t].name, "external_sync", externalSync, raw, summary);
+        printf("%s external_fail=%d initial_bytes=%lld after_one_sync_bytes=%lld after_group_delete_bytes=%lld after_clear_bytes=%lld\n",
+               targets[t].name, externalFail,
+               (long long)QFileInfo(pristine).size(),
+               (long long)sizeOne, (long long)sizeGroup, (long long)sizeClear);
+        if (externalFail)
+            return 31;
     }
     fflush(raw);
     summary.flush();
@@ -396,7 +558,7 @@ int main(int argc, char **argv)
     QCoreApplication app(argc, argv);
     const QStringList args = app.arguments();
     if (args.size() < 2) {
-        fprintf(stderr, "usage: qt_driver selftest|import|bench ...\n");
+        fprintf(stderr, "usage: qt_driver selftest|import|bench|fresh-one|external ...\n");
         return 1;
     }
     const QString cmd = args.at(1);
@@ -412,9 +574,27 @@ int main(int argc, char **argv)
             return 1;
         return bench(args.at(2), args.at(3), args.at(4));
     }
+    if (cmd == QLatin1String("fresh-one")) {
+        if (args.size() < 5)
+            return 1;
+        return freshOne(args.at(2), args.at(3), args.at(4));
+    }
     if (cmd == QLatin1String("external-writer")) {
-        qputenv("QSDB_BACKEND", "1");
-        QSettings s(args.at(2), QSettings::IniFormat);
+        QString kind = QStringLiteral("qsdb");
+        QString path;
+        if (args.size() >= 4 && (args.at(2) == QLatin1String("ini") || args.at(2) == QLatin1String("qsdb"))) {
+            kind = args.at(2);
+            path = args.at(3);
+        } else if (args.size() >= 3) {
+            path = args.at(2);
+        } else {
+            return 1;
+        }
+        if (kind == QLatin1String("qsdb"))
+            qputenv("QSDB_BACKEND", "1");
+        else
+            qunsetenv("QSDB_BACKEND");
+        QSettings s(path, QSettings::IniFormat);
         s.setValue(QStringLiteral("k-external-probe"), QStringLiteral("from-other-process"));
         s.sync();
         return s.status() == QSettings::NoError ? 0 : 2;

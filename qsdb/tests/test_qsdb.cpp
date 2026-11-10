@@ -5,6 +5,7 @@
 #include <string.h>
 #include <time.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <map>
@@ -401,6 +402,208 @@ static void test_snapshot_reader(const char *path)
     qsdb_close(db);
 }
 
+static uint64_t mono_ns()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+static uint64_t median_at(std::vector<uint64_t> s)
+{
+    if (s.empty())
+        return 0;
+    std::sort(s.begin(), s.end());
+    return s[s.size() / 2];
+}
+
+static uint64_t p95_at(std::vector<uint64_t> s)
+{
+    if (s.empty())
+        return 0;
+    std::sort(s.begin(), s.end());
+    return s[(s.size() - 1) * 95 / 100];
+}
+
+static int count_stop(const void *, size_t, uint32_t, uint64_t, void *user)
+{
+    int *left = static_cast<int *>(user);
+    if (*left <= 0)
+        return 1;
+    *left -= 1;
+    return 0;
+}
+
+static int count_scan(const void *, size_t, uint32_t, uint64_t, void *user)
+{
+    *static_cast<int *>(user) += 1;
+    return 0;
+}
+
+static void test_range_delete(const char *path)
+{
+    unlink(path);
+    qsdb *db = NULL;
+    expect(qsdb_open(path, QSDB_OPEN_CREATE, &db) == QSDB_OK, "range open");
+    qsdb_write *w = NULL;
+    expect(qsdb_begin_write(db, &w) == QSDB_OK, "range w");
+    put_str(w, "a", "1");
+    put_str(w, "foo", "2");
+    put_str(w, "foobar", "3");
+    put_str(w, "z", "4");
+    for (int i = 0; i < 800; ++i) {
+        char key[32];
+        snprintf(key, sizeof key, "foo/%04d", i);
+        put_str(w, key, "v");
+    }
+    expect(qsdb_commit(w) == QSDB_OK, "range commit");
+    qsdb_stat st;
+    qsdb_info(db, &st);
+    expect(st.nkeys == 804, "range nkeys before");
+    expect(qsdb_begin_write(db, &w) == QSDB_OK, "range w2");
+    const char sep[] = "/";
+    expect(qsdb_erase_tree(w, "foo", 3, sep, 1) == QSDB_OK, "range erase");
+    expect(qsdb_commit(w) == QSDB_OK, "range commit2");
+    qsdb_info(db, &st);
+    expect(st.nkeys == 3, "range nkeys after");
+    qsdb_read *r = NULL;
+    expect(qsdb_begin_read(db, &r) == QSDB_OK, "range read");
+    expect(get_str(r, "a") == "1", "range kept a");
+    expect(get_str(r, "foobar") == "3", "range kept foobar");
+    expect(get_str(r, "z") == "4", "range kept z");
+    expect(get_str(r, "foo") == "<missing>", "range removed foo");
+    expect(get_str(r, "foo/0000") == "<missing>", "range removed child");
+    expect(get_str(r, "foo/0799") == "<missing>", "range removed last child");
+    int seen = 0;
+    expect(qsdb_scan(r, NULL, 0, count_scan, &seen) == QSDB_OK, "range scan");
+    expect(seen == 3, "range scan count");
+    qsdb_end_read(r);
+    qsdb_close(db);
+}
+
+static int put_n(qsdb_write *w, const char *fmt, int begin, int count)
+{
+    for (int i = 0; i < count; ++i) {
+        char key[32];
+        int n = snprintf(key, sizeof key, fmt, begin + i);
+        int rc = qsdb_put(w, key, static_cast<size_t>(n), QSDB_TAG_BYTES, "x", 1);
+        if (rc != QSDB_OK)
+            return rc;
+    }
+    return QSDB_OK;
+}
+
+static void test_reader_across_growth(const char *path)
+{
+    unlink(path);
+    qsdb *db = NULL;
+    expect(qsdb_open(path, QSDB_OPEN_CREATE, &db) == QSDB_OK, "grow open");
+    qsdb_write *w = NULL;
+    expect(qsdb_begin_write(db, &w) == QSDB_OK, "grow w");
+    put_str(w, "keep", "v1");
+    /* Enough keys that the published file covers more than one 256 KiB window. */
+    expect(put_n(w, "n%06d", 0, 40000) == QSDB_OK, "grow batch");
+    expect(qsdb_commit(w) == QSDB_OK, "grow commit");
+    qsdb_stat st;
+    qsdb_info(db, &st);
+    expect(st.physical_bytes > 512ull * 1024ull, "grew past one window");
+    uint64_t root = qsdb_debug_root(db);
+    qsdb_read *old = NULL;
+    expect(qsdb_begin_read(db, &old) == QSDB_OK, "old reader");
+    expect(get_str(old, "keep") == "v1", "old sees keep");
+    expect(qsdb_debug_page_mapped(db, 2) == 1, "first tree page mapped");
+    uint64_t root_end = (root / 64 + 1) * 64ull * 4096ull;
+    if (st.physical_bytes >= root_end)
+        expect(qsdb_debug_page_mapped(db, root) == 1, "root window mapped");
+    uint64_t gen = qsdb_read_generation(old);
+    expect(qsdb_begin_write(db, &w) == QSDB_OK, "grow w2");
+    expect(put_n(w, "m%06d", 0, 40000) == QSDB_OK, "grow batch2");
+    expect(qsdb_commit(w) == QSDB_OK, "grow commit2");
+    qsdb_info(db, &st);
+    expect(st.physical_bytes > 1024ull * 1024ull, "file grew again");
+    expect(qsdb_read_generation(old) == gen, "old generation stable");
+    expect(get_str(old, "keep") == "v1", "old root still readable");
+    expect(get_str(old, "m000000") == "<missing>", "old root hides new keys");
+    expect(qsdb_debug_page_mapped(db, 2) == 1, "old window still mapped");
+    qsdb_end_read(old);
+    qsdb_read *neu = NULL;
+    expect(qsdb_begin_read(db, &neu) == QSDB_OK, "new reader");
+    expect(get_str(neu, "keep") == "v1", "new sees keep");
+    expect(get_str(neu, "m000000") == "x", "new sees appended keys");
+    expect(get_str(neu, "n000000") == "x", "new sees first batch");
+    qsdb_end_read(neu);
+    qsdb_close(db);
+}
+
+static void test_crc_and_fork(const char *path)
+{
+    unlink(path);
+    qsdb *db = NULL;
+    expect(qsdb_open(path, QSDB_OPEN_CREATE, &db) == QSDB_OK, "crc open");
+    qsdb_write *w = NULL;
+    qsdb_begin_write(db, &w);
+    put_str(w, "a", "A");
+    expect(qsdb_commit(w) == QSDB_OK, "crc commit");
+    uint64_t root = qsdb_debug_root(db);
+    qsdb_close(db);
+    FILE *f = fopen(path, "r+b");
+    expect(f != NULL, "crc fopen");
+    if (f) {
+        long off = static_cast<long>(root * 4096ull + 80ull);
+        expect(fseek(f, off, SEEK_SET) == 0, "crc seek");
+        int b = fgetc(f);
+        expect(b >= 0, "crc read");
+        fseek(f, off, SEEK_SET);
+        fputc(b ^ 0x5a, f);
+        fclose(f);
+    }
+    expect(qsdb_open(path, 0, &db) == QSDB_OK, "crc reopen meta");
+    qsdb_read *r = NULL;
+    expect(qsdb_begin_read(db, &r) == QSDB_OK, "crc meta still valid");
+    uint32_t tag = 0;
+    size_t n = 0;
+    int rc = qsdb_get(r, "a", 1, &tag, NULL, 0, &n, 0);
+    expect(rc == QSDB_CORRUPT, "flipped tree page fails CRC");
+    qsdb_end_read(r);
+    qsdb_close(db);
+
+#if !defined(_WIN32)
+    unlink(path);
+    expect(qsdb_open(path, QSDB_OPEN_CREATE, &db) == QSDB_OK, "fork open");
+    qsdb_begin_write(db, &w);
+    put_str(w, "old", "O");
+    expect(qsdb_commit(w) == QSDB_OK, "fork seed");
+    qsdb_read *held = NULL;
+    expect(qsdb_begin_read(db, &held) == QSDB_OK, "fork held");
+    pid_t pid = fork();
+    expect(pid >= 0, "fork merge");
+    if (pid == 0) {
+        qsdb *c = NULL;
+        if (qsdb_open(path, 0, &c) != QSDB_OK)
+            _exit(2);
+        qsdb_write *cw = NULL;
+        if (qsdb_begin_write(c, &cw) != QSDB_OK)
+            _exit(3);
+        if (qsdb_put(cw, "from-child", 10, QSDB_TAG_BYTES, "C", 1) != QSDB_OK)
+            _exit(4);
+        if (qsdb_commit(cw) != QSDB_OK)
+            _exit(5);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    expect(WIFEXITED(status) && WEXITSTATUS(status) == 0, "child committed");
+    expect(get_str(held, "old") == "O", "held reader keeps old");
+    expect(get_str(held, "from-child") == "<missing>", "held reader misses child commit");
+    qsdb_end_read(held);
+    expect(qsdb_begin_read(db, &r) == QSDB_OK, "parent refresh");
+    expect(get_str(r, "old") == "O", "parent sees old");
+    expect(get_str(r, "from-child") == "C", "parent sees child after new snapshot");
+    qsdb_end_read(r);
+    qsdb_close(db);
+#endif
+}
+
 static void test_million(const char *path)
 {
     unlink(path);
@@ -439,16 +642,56 @@ static void test_million(const char *path)
     qsdb_read *r = NULL;
     qsdb_begin_read(db, &r);
     unsigned seed = 1;
+    std::vector<uint64_t> get_ns, miss_ns, contains_ns;
+    get_ns.reserve(1000);
     for (int i = 0; i < 1000; ++i) {
         seed = seed * 1664525u + 1013904223u;
         int id = static_cast<int>(seed % N);
         snprintf(key, sizeof key, "k%07d", id);
         snprintf(val, sizeof val, "%d", id);
-        if (get_str(r, key) != val) {
+        char buf[32];
+        uint32_t tag = 0;
+        size_t gotn = 0;
+        uint64_t t0 = mono_ns();
+        int grc = qsdb_get(r, key, strlen(key), &tag, buf, sizeof buf, &gotn, 0);
+        uint64_t t1 = mono_ns();
+        get_ns.push_back(t1 - t0);
+        if (grc != QSDB_OK || std::string(buf, gotn) != val) {
             expect(0, "million random get");
             break;
         }
     }
+    for (int i = 0; i < 1000; ++i) {
+        uint64_t t0 = mono_ns();
+        int rc = qsdb_contains(r, "missing-million", 15);
+        uint64_t t1 = mono_ns();
+        miss_ns.push_back(t1 - t0);
+        if (rc != QSDB_NOT_FOUND) {
+            expect(0, "million miss");
+            break;
+        }
+        t0 = mono_ns();
+        rc = qsdb_contains(r, "k0000000", 8);
+        t1 = mono_ns();
+        contains_ns.push_back(t1 - t0);
+        if (rc != QSDB_OK) {
+            expect(0, "million contains");
+            break;
+        }
+    }
+    int left = 1000;
+    uint64_t s0 = mono_ns();
+    expect(qsdb_scan(r, "k0001000", 8, count_stop, &left) == QSDB_OK, "million scan");
+    uint64_t s1 = mono_ns();
+    fprintf(stderr,
+            "million_core samples=1000 get_median_ns=%llu get_p95_ns=%llu miss_median_ns=%llu miss_p95_ns=%llu contains_median_ns=%llu contains_p95_ns=%llu scan_1000_ns=%llu\n",
+            (unsigned long long)median_at(get_ns),
+            (unsigned long long)p95_at(get_ns),
+            (unsigned long long)median_at(miss_ns),
+            (unsigned long long)p95_at(miss_ns),
+            (unsigned long long)median_at(contains_ns),
+            (unsigned long long)p95_at(contains_ns),
+            (unsigned long long)(s1 - s0));
     expect(get_str(r, "k0000000") == "0", "first");
     expect(get_str(r, "k0999999") == "999999", "last");
     expect(qsdb_contains(r, "missing", 7) == QSDB_NOT_FOUND, "million miss");
@@ -463,6 +706,30 @@ static void test_million(const char *path)
     uint64_t grew = st.high_water_pages - pages_before;
     fprintf(stderr, "million one-key page growth=%llu\n", (unsigned long long)grew);
     expect(grew > 0 && grew < 32, "one key does not copy a million-key index");
+    uint64_t before_pages = st.high_water_pages;
+    uint64_t before_bytes = st.physical_bytes;
+    qsdb_begin_write(db, &w);
+    uint64_t e0 = mono_ns();
+    expect(qsdb_erase_tree(w, "k000", 4, "1", 1) == QSDB_OK, "million range");
+    uint64_t e1 = mono_ns();
+    expect(qsdb_commit(w) == QSDB_OK, "million range commit");
+    uint64_t e2 = mono_ns();
+    qsdb_info(db, &st);
+    fprintf(stderr, "million_range_delete_ns=%llu range_commit_ns=%llu pages_after=%llu bytes_after=%llu nkeys=%llu\n",
+            (unsigned long long)(e1 - e0), (unsigned long long)(e2 - e1),
+            (unsigned long long)st.high_water_pages, (unsigned long long)st.physical_bytes,
+            (unsigned long long)st.nkeys);
+    expect(st.nkeys == static_cast<uint64_t>(N + 1 - 1000), "range removed 1000 keys");
+    expect(st.high_water_pages >= before_pages, "range delete does not shrink high water");
+    (void)before_bytes;
+    qsdb_begin_write(db, &w);
+    uint64_t c0 = mono_ns();
+    expect(qsdb_clear(w) == QSDB_OK, "million clear");
+    uint64_t c1 = mono_ns();
+    expect(qsdb_commit(w) == QSDB_OK, "million clear commit");
+    uint64_t c2 = mono_ns();
+    fprintf(stderr, "million_clear_ns=%llu clear_commit_ns=%llu\n",
+            (unsigned long long)(c1 - c0), (unsigned long long)(c2 - c1));
     qsdb_close(db);
 }
 
@@ -480,6 +747,12 @@ int main(int argc, char **argv)
     test_enospc(path);
     snprintf(path, sizeof path, "%s/qsdb-snap.db", dir);
     test_snapshot_reader(path);
+    snprintf(path, sizeof path, "%s/qsdb-range.db", dir);
+    test_range_delete(path);
+    snprintf(path, sizeof path, "%s/qsdb-grow.db", dir);
+    test_reader_across_growth(path);
+    snprintf(path, sizeof path, "%s/qsdb-crc.db", dir);
+    test_crc_and_fork(path);
     snprintf(path, sizeof path, "%s/qsdb-unc.db", dir);
     test_uncertain(path);
     struct {

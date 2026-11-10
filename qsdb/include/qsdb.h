@@ -9,9 +9,13 @@
  * root only after the new pages have been written and flushed.
  *
  * This is not a production database: freed pages are not reclaimed online,
- * so repeated updates grow the file until an offline rebuild. Windows IO is
- * implemented without a file mapping (so growth does not depend on
- * SetEndOfFile of a mapped file) and is not exercised by the Linux tests.
+ * so repeated updates grow the file until an offline rebuild.
+ *
+ * Readers may map fixed, already-allocated windows of the file read-only.
+ * A window is never extended in place. Growth appends, then a later read
+ * maps only the newly complete windows. Windows has the same shape
+ * (CreateFileMapping of an existing range, PAGE_READONLY) and is not
+ * exercised by the Linux tests.
  */
 
 #include <stddef.h>
@@ -93,10 +97,17 @@ uint64_t qsdb_read_generation(const qsdb_read *tx);
 int qsdb_get(qsdb_read *tx, const void *key, size_t key_len,
              uint32_t *tag, void *buf, size_t buf_cap, size_t *out_len,
              uint64_t offset);
+/* One tree walk. *out_ptr is malloc'd and must be free()'d. Not found leaves it NULL. */
+int qsdb_get_alloc(qsdb_read *tx, const void *key, size_t key_len,
+                   uint32_t *tag, void **out_ptr, size_t *out_len);
 int qsdb_contains(qsdb_read *tx, const void *key, size_t key_len);
 
 int qsdb_scan(qsdb_read *tx, const void *start, size_t start_len,
               qsdb_scan_fn fn, void *user);
+/* end == NULL scans through the last key. Otherwise end is exclusive. */
+int qsdb_scan_range(qsdb_read *tx, const void *start, size_t start_len,
+                    const void *end, size_t end_len,
+                    qsdb_scan_fn fn, void *user);
 
 int qsdb_begin_write(qsdb *db, qsdb_write **out);
 int qsdb_put(qsdb_write *tx, const void *key, size_t key_len,
@@ -113,6 +124,9 @@ void qsdb_abort(qsdb_write *tx);
 void qsdb_debug_crash_at(qsdb *db, int phase);
 void qsdb_debug_fail_fsync(qsdb *db, int which); /* 1 data fsync, 2 meta fsync */
 void qsdb_debug_max_bytes(qsdb *db, uint64_t bytes); /* 0 = no limit */
+uint64_t qsdb_debug_root(qsdb *db);
+/* 1 if this page is inside a live read-only window, else 0. */
+int qsdb_debug_page_mapped(qsdb *db, uint64_t page_id);
 
 #ifdef __cplusplus
 }

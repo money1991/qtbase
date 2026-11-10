@@ -20,6 +20,7 @@
 #else
 #  include <fcntl.h>
 #  include <pthread.h>
+#  include <sys/mman.h>
 #  include <sys/stat.h>
 #  include <unistd.h>
 #endif
@@ -38,14 +39,52 @@ constexpr char kPageMagic[4] = {'Q', 'S', 'P', 'G'};
 
 enum PageType : uint16_t { kLeaf = 1, kInternal = 2, kOverflow = 3 };
 
+/* Same reflected IEEE CRC-32 as the previous bit loop (polynomial 0xEDB88320).
+ * "123456789" checks as 0xCBF43926. Only the implementation is faster. */
+uint32_t crc_table[256];
+int crc_ready = 0;
+
+void init_crc_table()
+{
+    if (crc_ready)
+        return;
+    for (uint32_t i = 0; i < 256; ++i) {
+        uint32_t c = i;
+        for (int b = 0; b < 8; ++b)
+            c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+        crc_table[i] = c;
+    }
+    crc_ready = 1;
+    static const uint8_t check[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < sizeof check; ++i)
+        crc = crc_table[(crc ^ check[i]) & 0xFFu] ^ (crc >> 8);
+    if (~crc != 0xCBF43926u) {
+        fprintf(stderr, "qsdb crc32 self-check failed\n");
+        abort();
+    }
+}
+
 uint32_t crc32_ieee(const uint8_t *data, size_t n)
 {
+    init_crc_table();
     uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < n; ++i) {
-        crc ^= data[i];
-        for (int b = 0; b < 8; ++b)
-            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
-    }
+    for (size_t i = 0; i < n; ++i)
+        crc = crc_table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+    return ~crc;
+}
+
+/* CRC of a page whose stored checksum bytes (offset 4..7) are treated as zero. */
+uint32_t crc32_page(const uint8_t *p)
+{
+    init_crc_table();
+    uint32_t crc = 0xFFFFFFFFu;
+    for (int i = 0; i < 4; ++i)
+        crc = crc_table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
+    for (int i = 0; i < 4; ++i)
+        crc = crc_table[crc & 0xFFu] ^ (crc >> 8);
+    for (int i = 8; i < int(kPage); ++i)
+        crc = crc_table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
     return ~crc;
 }
 
@@ -157,7 +196,7 @@ int os_open(OsFile *f, const char *path, bool create, bool readonly)
     std::wstring w(static_cast<size_t>(n), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, path, -1, &w[0], n);
     f->h = CreateFileW(w.c_str(), access, share, NULL, disp, FILE_ATTRIBUTE_NORMAL, NULL);
-    /* No file mapping is created. Growth uses SetEndOfFile on this handle. */
+    /* Mappings are created later, only for ranges the file already holds. */
     return f->h == INVALID_HANDLE_VALUE ? QSDB_IO : QSDB_OK;
 }
 
@@ -362,6 +401,19 @@ int os_fsync_dir(const std::string &path)
 
 } // namespace
 
+/* 256 KiB. Multiple of the 64 KiB Windows allocation granularity, so a view
+ * can start on a window boundary. A short tail is read with pread and is
+ * not mapped until the file grows enough to complete the window. */
+constexpr uint32_t kWinPages = 64;
+
+struct MapWin {
+    uint8_t *addr = 0;
+    uint32_t pages = 0;
+#if defined(_WIN32)
+    void *mapping = 0;
+#endif
+};
+
 struct qsdb {
     OsFile file;
 #if !defined(_WIN32)
@@ -376,6 +428,14 @@ struct qsdb {
     bool writing = false;
     bool readonly = false;
     uint32_t create_cmp = kCmpBytes;
+    std::vector<MapWin> maps;
+    std::vector<uint8_t> crc_ok;
+#if defined(_WIN32)
+    CRITICAL_SECTION map_mu;
+#else
+    pthread_mutex_t map_mu;
+#endif
+    bool map_mu_ready = false;
 };
 
 struct qsdb_read {
@@ -449,10 +509,7 @@ int check_page(const Page &p, char const magic[4], uint64_t expect_id, bool chec
 {
     if (memcmp(p.b, magic, 4) != 0)
         return QSDB_CORRUPT;
-    uint32_t stored = rd32(p.b + 4);
-    Page tmp = p;
-    wr32(tmp.b + 4, 0);
-    if (crc32_ieee(tmp.b, kPage) != stored)
+    if (crc32_page(p.b) != rd32(p.b + 4))
         return QSDB_CORRUPT;
     if (check_id && rd64(p.b + 8) != expect_id)
         return QSDB_CORRUPT;
@@ -526,14 +583,197 @@ int ensure_physical(qsdb *db, uint64_t need)
     return QSDB_OK;
 }
 
-int read_page(qsdb *db, uint64_t id, uint64_t hw_limit, Page *p)
+void map_lock(qsdb *db)
+{
+    if (!db->map_mu_ready)
+        return;
+#if defined(_WIN32)
+    EnterCriticalSection(&db->map_mu);
+#else
+    pthread_mutex_lock(&db->map_mu);
+#endif
+}
+
+void map_unlock(qsdb *db)
+{
+    if (!db->map_mu_ready)
+        return;
+#if defined(_WIN32)
+    LeaveCriticalSection(&db->map_mu);
+#else
+    pthread_mutex_unlock(&db->map_mu);
+#endif
+}
+
+void unmap_one(MapWin *w)
+{
+    if (!w->addr)
+        return;
+#if defined(_WIN32)
+    UnmapViewOfFile(w->addr);
+    if (w->mapping)
+        CloseHandle(static_cast<HANDLE>(w->mapping));
+    w->mapping = 0;
+#else
+    munmap(w->addr, static_cast<size_t>(w->pages) * kPage);
+#endif
+    w->addr = 0;
+    w->pages = 0;
+}
+
+void release_maps(qsdb *db)
+{
+    map_lock(db);
+    for (size_t i = 0; i < db->maps.size(); ++i)
+        unmap_one(&db->maps[i]);
+    db->maps.clear();
+    db->crc_ok.clear();
+    map_unlock(db);
+}
+
+/* Drop windows that extend past keep bytes. Call this before shrinking the file. */
+void unmap_beyond(qsdb *db, uint64_t keep)
+{
+    map_lock(db);
+    for (size_t i = 0; i < db->maps.size(); ++i) {
+        if (!db->maps[i].addr)
+            continue;
+        uint64_t start = static_cast<uint64_t>(i) * kWinPages * kPage;
+        uint64_t end = start + static_cast<uint64_t>(db->maps[i].pages) * kPage;
+        if (start >= keep || end > keep)
+            unmap_one(&db->maps[i]);
+    }
+    uint64_t keep_pages = keep / kPage;
+    if (db->crc_ok.size() > keep_pages)
+        db->crc_ok.resize(static_cast<size_t>(keep_pages));
+    map_unlock(db);
+}
+
+int refresh_size(qsdb *db)
+{
+    uint64_t sz = 0;
+    int rc = os_size(&db->file, &sz);
+    if (rc)
+        return rc;
+    if (sz > db->physical)
+        db->physical = sz;
+    return QSDB_OK;
+}
+
+int map_complete_window(qsdb *db, uint64_t win)
+{
+    uint64_t first = win * kWinPages;
+    uint64_t file_pages = db->physical / kPage;
+    if (first + kWinPages > file_pages)
+        return QSDB_IO;
+    if (db->maps.size() <= win)
+        db->maps.resize(static_cast<size_t>(win) + 1);
+    if (db->maps[static_cast<size_t>(win)].addr)
+        return QSDB_OK;
+    uint64_t off = first * kPage;
+    size_t bytes = static_cast<size_t>(kWinPages) * kPage;
+#if defined(_WIN32)
+    /* Size the mapping object to the end of this window, which is already
+     * inside the file. PAGE_READONLY cannot extend the file. The view is
+     * not grown later; a longer file gets a new window. */
+    uint64_t end = off + bytes;
+    HANDLE fm = CreateFileMappingW(db->file.h, NULL, PAGE_READONLY,
+                                   static_cast<DWORD>(end >> 32),
+                                   static_cast<DWORD>(end), NULL);
+    if (!fm)
+        return QSDB_IO;
+    void *view = MapViewOfFile(fm, FILE_MAP_READ,
+                               static_cast<DWORD>(off >> 32),
+                               static_cast<DWORD>(off), bytes);
+    if (!view) {
+        CloseHandle(fm);
+        return QSDB_IO;
+    }
+    db->maps[static_cast<size_t>(win)].addr = static_cast<uint8_t *>(view);
+    db->maps[static_cast<size_t>(win)].pages = kWinPages;
+    db->maps[static_cast<size_t>(win)].mapping = fm;
+#else
+    void *view = mmap(NULL, bytes, PROT_READ, MAP_SHARED, db->file.fd, static_cast<off_t>(off));
+    if (view == MAP_FAILED)
+        return QSDB_IO;
+    db->maps[static_cast<size_t>(win)].addr = static_cast<uint8_t *>(view);
+    db->maps[static_cast<size_t>(win)].pages = kWinPages;
+#endif
+    return QSDB_OK;
+}
+
+int verify_tree_page(qsdb *db, uint64_t id, const uint8_t *p)
+{
+    map_lock(db);
+    bool cached = id < db->crc_ok.size() && db->crc_ok[static_cast<size_t>(id)];
+    map_unlock(db);
+    if (cached)
+        return QSDB_OK;
+    if (memcmp(p, kPageMagic, 4) != 0)
+        return QSDB_CORRUPT;
+    if (crc32_page(p) != rd32(p + 4))
+        return QSDB_CORRUPT;
+    if (rd64(p + 8) != id)
+        return QSDB_CORRUPT;
+    /* Only pages published by a commit are immutable. A page allocated in
+     * the current transaction can be rewritten, so it must not be cached. */
+    if (id < db->committed.high_water) {
+        map_lock(db);
+        if (db->crc_ok.size() <= id)
+            db->crc_ok.resize(static_cast<size_t>(id) + 1, 0);
+        db->crc_ok[static_cast<size_t>(id)] = 1;
+        map_unlock(db);
+    }
+    return QSDB_OK;
+}
+
+int view_page(qsdb *db, uint64_t id, uint64_t hw_limit, const uint8_t **out, Page *scratch)
 {
     if (id < 2 || id >= hw_limit)
         return QSDB_CORRUPT;
-    int rc = os_pread(&db->file, p->b, kPage, id * kPage);
+    uint64_t need = (id + 1) * kPage;
+    if (need > db->physical) {
+        int rc = refresh_size(db);
+        if (rc)
+            return rc;
+        if (need > db->physical)
+            return QSDB_CORRUPT;
+    }
+    uint64_t win = id / kWinPages;
+    bool complete = (win + 1) * kWinPages * kPage <= db->physical;
+    if (complete) {
+        map_lock(db);
+        int rc = map_complete_window(db, win);
+        const uint8_t *base = (rc == QSDB_OK) ? db->maps[static_cast<size_t>(win)].addr : 0;
+        map_unlock(db);
+        if (base) {
+            const uint8_t *p = base + (id - win * kWinPages) * kPage;
+            rc = verify_tree_page(db, id, p);
+            if (rc)
+                return rc;
+            *out = p;
+            return QSDB_OK;
+        }
+    }
+    int rc = os_pread(&db->file, scratch->b, kPage, id * kPage);
     if (rc)
         return rc;
-    return check_page(*p, kPageMagic, id, true);
+    rc = verify_tree_page(db, id, scratch->b);
+    if (rc)
+        return rc;
+    *out = scratch->b;
+    return QSDB_OK;
+}
+
+int read_page(qsdb *db, uint64_t id, uint64_t hw_limit, Page *p)
+{
+    const uint8_t *v = 0;
+    int rc = view_page(db, id, hw_limit, &v, p);
+    if (rc)
+        return rc;
+    if (v != p->b)
+        memcpy(p->b, v, kPage);
+    return QSDB_OK;
 }
 
 int write_page(qsdb *db, uint64_t id, Page *p)
@@ -547,6 +787,10 @@ int write_page(qsdb *db, uint64_t id, Page *p)
     wr64(p->b + 8, id);
     memcpy(p->b, kPageMagic, 4);
     seal(p);
+    map_lock(db);
+    if (id < db->crc_ok.size())
+        db->crc_ok[static_cast<size_t>(id)] = 0;
+    map_unlock(db);
     return os_pwrite(&db->file, p->b, kPage, id * kPage);
 }
 
@@ -1214,16 +1458,198 @@ Del delete_page(qsdb_write *tx, uint64_t page, const uint8_t *key, uint32_t klen
     return d;
 }
 
-bool prefix_hit(const uint8_t *key, size_t klen, const uint8_t *pfx, size_t plen,
-                const uint8_t *sep, size_t seplen)
+const uint8_t *slot_ptr(const uint8_t *page, int slot, int nslots, int *err)
 {
-    if (klen == plen && (plen == 0 || memcmp(key, pfx, plen) == 0))
-        return true;
-    if (seplen == 0 || klen < plen + seplen)
-        return false;
-    if (memcmp(key, pfx, plen) != 0)
-        return false;
-    return memcmp(key + plen, sep, seplen) == 0;
+    if (slot < 0 || slot >= nslots || (static_cast<uint32_t>(kHdr) + static_cast<uint32_t>(nslots) * 2u) > kPage) {
+        *err = QSDB_CORRUPT;
+        return 0;
+    }
+    uint16_t off = rd16(page + kHdr + slot * 2);
+    if (off < kHdr || off >= kPage) {
+        *err = QSDB_CORRUPT;
+        return 0;
+    }
+    return page + off;
+}
+
+int cmp_wire_key(qsdb *db, uint64_t hw, uint32_t mode, const uint8_t *page, const uint8_t *wire,
+                 const uint8_t *key, uint32_t klen, int *err)
+{
+    if (wire < page || wire + 8 > page + kPage) {
+        *err = QSDB_CORRUPT;
+        return 0;
+    }
+    uint32_t key_len = rd32(wire);
+    uint16_t flags = rd16(wire + 4);
+    if (flags & 1) {
+        if (wire + 16 > page + kPage) {
+            *err = QSDB_CORRUPT;
+            return 0;
+        }
+        std::vector<uint8_t> tmp;
+        *err = read_overflow(db, rd64(wire + 8), hw, key_len, &tmp);
+        if (*err)
+            return 0;
+        return cmp_keys(mode, tmp.data(), static_cast<uint32_t>(tmp.size()), key, klen);
+    }
+    if (key_len > kPage || wire + 8 + key_len > page + kPage) {
+        *err = QSDB_CORRUPT;
+        return 0;
+    }
+    return cmp_keys(mode, wire + 8, key_len, key, klen);
+}
+
+int cmp_leaf_slot(qsdb *db, uint64_t hw, uint32_t mode, const uint8_t *page, int nslots, int slot,
+                  const uint8_t *key, uint32_t klen, int *err)
+{
+    const uint8_t *r = slot_ptr(page, slot, nslots, err);
+    if (*err)
+        return 0;
+    if (r + 16 > page + kPage) {
+        *err = QSDB_CORRUPT;
+        return 0;
+    }
+    uint32_t key_len = rd32(r);
+    uint16_t flags = rd16(r + 12);
+    const uint8_t *q = r + 16;
+    if (flags & 1) {
+        if (q + 8 > page + kPage) {
+            *err = QSDB_CORRUPT;
+            return 0;
+        }
+        std::vector<uint8_t> tmp;
+        *err = read_overflow(db, rd64(q), hw, key_len, &tmp);
+        if (*err)
+            return 0;
+        return cmp_keys(mode, tmp.data(), static_cast<uint32_t>(tmp.size()), key, klen);
+    }
+    if (q + key_len > page + kPage) {
+        *err = QSDB_CORRUPT;
+        return 0;
+    }
+    return cmp_keys(mode, q, key_len, key, klen);
+}
+
+int cmp_sep_slot(qsdb *db, uint64_t hw, uint32_t mode, const uint8_t *page, int nslots, int slot,
+                 const uint8_t *key, uint32_t klen, int *err)
+{
+    const uint8_t *r = slot_ptr(page, slot, nslots, err);
+    if (*err)
+        return 0;
+    return cmp_wire_key(db, hw, mode, page, r + 8, key, klen, err);
+}
+
+int leaf_lower_bound(qsdb *db, uint64_t hw, uint32_t mode, const uint8_t *page, int nslots,
+                     const uint8_t *key, uint32_t klen, int *err)
+{
+    int lo = 0;
+    int hi = nslots;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        int c = cmp_leaf_slot(db, hw, mode, page, nslots, mid, key, klen, err);
+        if (*err)
+            return 0;
+        if (c < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+int extract_leaf_slot(qsdb *, uint64_t, const uint8_t *page, int nslots, int slot,
+                      Item *it, bool copy_val)
+{
+    int err = 0;
+    const uint8_t *r = slot_ptr(page, slot, nslots, &err);
+    if (err)
+        return err;
+    if (r + 16 > page + kPage)
+        return QSDB_CORRUPT;
+    uint32_t key_len = rd32(r);
+    it->val_len = rd32(r + 4);
+    it->tag = rd32(r + 8);
+    uint16_t flags = rd16(r + 12);
+    const uint8_t *q = r + 16;
+    it->key_is_ovf = (flags & 1) != 0;
+    it->val_is_ovf = (flags & 2) != 0;
+    it->key.clear();
+    it->val.clear();
+    if (it->key_is_ovf) {
+        if (q + 8 > page + kPage)
+            return QSDB_CORRUPT;
+        it->key_ovf = rd64(q);
+        q += 8;
+    } else {
+        if (q + key_len > page + kPage)
+            return QSDB_CORRUPT;
+        q += key_len;
+    }
+    if (!copy_val)
+        return QSDB_OK;
+    if (it->val_is_ovf) {
+        if (q + 8 > page + kPage)
+            return QSDB_CORRUPT;
+        it->val_ovf = rd64(q);
+        return QSDB_OK;
+    }
+    if (q + it->val_len > page + kPage)
+        return QSDB_CORRUPT;
+    if (it->val_len)
+        it->val.assign(q, q + it->val_len);
+    return QSDB_OK;
+}
+
+int load_leaf_key(qsdb *db, uint64_t hw, const uint8_t *page, int nslots, int slot,
+                  std::vector<uint8_t> *key, uint32_t *tag, uint64_t *vlen)
+{
+    int err = 0;
+    const uint8_t *r = slot_ptr(page, slot, nslots, &err);
+    if (err)
+        return err;
+    if (r + 16 > page + kPage)
+        return QSDB_CORRUPT;
+    uint32_t key_len = rd32(r);
+    uint32_t val_len = rd32(r + 4);
+    *tag = rd32(r + 8);
+    uint16_t flags = rd16(r + 12);
+    const uint8_t *q = r + 16;
+    if (flags & 1) {
+        if (q + 8 > page + kPage)
+            return QSDB_CORRUPT;
+        uint64_t ov = rd64(q);
+        q += 8;
+        int rc = read_overflow(db, ov, hw, key_len, key);
+        if (rc)
+            return rc;
+    } else {
+        if (q + key_len > page + kPage)
+            return QSDB_CORRUPT;
+        key->assign(q, q + key_len);
+        q += key_len;
+    }
+    if (flags & 2) {
+        *vlen = val_len;
+        return QSDB_OK;
+    }
+    if (q + val_len > page + kPage)
+        return QSDB_CORRUPT;
+    *vlen = val_len;
+    return QSDB_OK;
+}
+
+uint64_t child_id_at(const uint8_t *page, int nslots, int index, int *err)
+{
+    if (index == 0)
+        return rd64(page + 24);
+    const uint8_t *r = slot_ptr(page, index - 1, nslots, err);
+    if (*err)
+        return 0;
+    if (r + 8 > page + kPage) {
+        *err = QSDB_CORRUPT;
+        return 0;
+    }
+    return rd64(r);
 }
 
 struct WalkCtx {
@@ -1232,11 +1658,15 @@ struct WalkCtx {
     uint32_t cmp;
     const uint8_t *start;
     uint32_t start_len;
+    const uint8_t *end;
+    uint32_t end_len;
+    bool has_end;
     bool begun;
     qsdb_scan_fn fn;
     void *user;
     int rc;
     int stop;
+    std::vector<uint8_t> keybuf;
 };
 
 int walk(WalkCtx *w, uint64_t page, int depth)
@@ -1245,24 +1675,41 @@ int walk(WalkCtx *w, uint64_t page, int depth)
         return w->rc;
     if (depth > 64)
         return w->rc = QSDB_CORRUPT;
-    Page p;
-    int rc = read_page(w->db, page, w->hw, &p);
+    Page scratch;
+    const uint8_t *p = 0;
+    int rc = view_page(w->db, page, w->hw, &p, &scratch);
     if (rc)
         return w->rc = rc;
-    uint16_t type = rd16(p.b + 16);
+    uint16_t type = rd16(p + 16);
+    int nslots = rd16(p + 18);
+    if (static_cast<uint32_t>(kHdr) + static_cast<uint32_t>(nslots) * 2u > kPage)
+        return w->rc = QSDB_CORRUPT;
     if (type == kLeaf) {
-        std::vector<Item> items;
-        rc = load_leaf(w->db, w->hw, p, &items);
-        if (rc)
-            return w->rc = rc;
-        for (size_t i = 0; i < items.size(); ++i) {
-            if (!w->begun) {
-                if (cmp_vec(w->cmp, items[i].key, w->start, w->start_len) < 0)
-                    continue;
-                w->begun = true;
+        int begin = 0;
+        if (!w->begun) {
+            int err = 0;
+            begin = leaf_lower_bound(w->db, w->hw, w->cmp, p, nslots, w->start, w->start_len, &err);
+            if (err)
+                return w->rc = err;
+        }
+        for (int i = begin; i < nslots; ++i) {
+            if (w->has_end) {
+                int err = 0;
+                int c = cmp_leaf_slot(w->db, w->hw, w->cmp, p, nslots, i, w->end, w->end_len, &err);
+                if (err)
+                    return w->rc = err;
+                if (c >= 0) {
+                    w->stop = 1;
+                    return 0;
+                }
             }
-            uint64_t vlen = items[i].val_is_ovf ? items[i].val_len : items[i].val.size();
-            int s = w->fn(items[i].key.data(), items[i].key.size(), items[i].tag, vlen, w->user);
+            uint32_t tag = 0;
+            uint64_t vlen = 0;
+            rc = load_leaf_key(w->db, w->hw, p, nslots, i, &w->keybuf, &tag, &vlen);
+            if (rc)
+                return w->rc = rc;
+            w->begun = true;
+            int s = w->fn(w->keybuf.data(), w->keybuf.size(), tag, vlen, w->user);
             if (s) {
                 w->stop = 1;
                 return 0;
@@ -1270,16 +1717,33 @@ int walk(WalkCtx *w, uint64_t page, int depth)
         }
         return 0;
     }
-    uint64_t leftmost = 0;
-    std::vector<Item> seps;
-    rc = load_internal(w->db, w->hw, p, &leftmost, &seps);
-    if (rc)
-        return w->rc = rc;
-    for (size_t i = 0; i <= seps.size(); ++i) {
-        if (!w->begun && i < seps.size()
-            && cmp_vec(w->cmp, seps[i].key, w->start, w->start_len) <= 0)
-            continue;
-        uint64_t child = (i == 0) ? leftmost : seps[i - 1].child;
+    if (type != kInternal)
+        return w->rc = QSDB_CORRUPT;
+    int begin = 0;
+    if (!w->begun) {
+        while (begin < nslots) {
+            int err = 0;
+            int c = cmp_sep_slot(w->db, w->hw, w->cmp, p, nslots, begin, w->start, w->start_len, &err);
+            if (err)
+                return w->rc = err;
+            if (c > 0)
+                break;
+            ++begin;
+        }
+    }
+    for (int i = begin; i <= nslots; ++i) {
+        if (w->has_end && i > 0) {
+            int err = 0;
+            int c = cmp_sep_slot(w->db, w->hw, w->cmp, p, nslots, i - 1, w->end, w->end_len, &err);
+            if (err)
+                return w->rc = err;
+            if (c >= 0)
+                break;
+        }
+        int err = 0;
+        uint64_t child = child_id_at(p, nslots, i, &err);
+        if (err)
+            return w->rc = err;
         rc = walk(w, child, depth + 1);
         if (rc || w->stop)
             return rc;
@@ -1287,45 +1751,52 @@ int walk(WalkCtx *w, uint64_t page, int depth)
     return 0;
 }
 
-int lookup_item(qsdb_read *tx, const uint8_t *key, uint32_t klen, Item *found)
+int lookup_item(qsdb_read *tx, const uint8_t *key, uint32_t klen, Item *found, bool copy_val)
 {
     uint64_t page = tx->root;
     for (int depth = 0; depth < 64; ++depth) {
-        Page p;
-        int rc = read_page(tx->db, page, tx->high_water, &p);
+        Page scratch;
+        const uint8_t *p = 0;
+        int rc = view_page(tx->db, page, tx->high_water, &p, &scratch);
         if (rc)
             return rc;
-        uint16_t type = rd16(p.b + 16);
+        uint16_t type = rd16(p + 16);
+        int nslots = rd16(p + 18);
+        if (static_cast<uint32_t>(kHdr) + static_cast<uint32_t>(nslots) * 2u > kPage)
+            return QSDB_CORRUPT;
         if (type == kLeaf) {
-            std::vector<Item> items;
-            rc = load_leaf(tx->db, tx->high_water, p, &items);
-            if (rc)
-                return rc;
-            int lo = 0, hi = static_cast<int>(items.size());
-            while (lo < hi) {
-                int mid = (lo + hi) / 2;
-                int c = cmp_vec(tx->cmp, items[static_cast<size_t>(mid)].key, key, klen);
-                if (c < 0)
-                    lo = mid + 1;
-                else
-                    hi = mid;
-            }
-            if (lo < static_cast<int>(items.size())
-                && cmp_vec(tx->cmp, items[static_cast<size_t>(lo)].key, key, klen) == 0) {
-                *found = std::move(items[static_cast<size_t>(lo)]);
-                return QSDB_OK;
-            }
-            return QSDB_NOT_FOUND;
+            int err = 0;
+            int lo = leaf_lower_bound(tx->db, tx->high_water, tx->cmp, p, nslots, key, klen, &err);
+            if (err)
+                return err;
+            if (lo >= nslots)
+                return QSDB_NOT_FOUND;
+            int c = cmp_leaf_slot(tx->db, tx->high_water, tx->cmp, p, nslots, lo, key, klen, &err);
+            if (err)
+                return err;
+            if (c != 0)
+                return QSDB_NOT_FOUND;
+            return extract_leaf_slot(tx->db, tx->high_water, p, nslots, lo, found, copy_val);
         }
         if (type != kInternal)
             return QSDB_CORRUPT;
-        uint64_t leftmost = 0;
-        std::vector<Item> seps;
-        rc = load_internal(tx->db, tx->high_water, p, &leftmost, &seps);
-        if (rc)
-            return rc;
-        int ci = find_child(tx->cmp, seps, key, klen);
-        page = (ci == 0) ? leftmost : seps[static_cast<size_t>(ci - 1)].child;
+        int lo = 0;
+        int hi = nslots;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            int err = 0;
+            int c = cmp_sep_slot(tx->db, tx->high_water, tx->cmp, p, nslots, mid, key, klen, &err);
+            if (err)
+                return err;
+            if (c <= 0)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        int err = 0;
+        page = child_id_at(p, nslots, lo, &err);
+        if (err)
+            return err;
     }
     return QSDB_CORRUPT;
 }
@@ -1385,6 +1856,269 @@ bool del_err(const Del &d)
     return d.changed && d.gone && d.page != 0 && d.page < 64;
 }
 
+uint64_t count_keys(qsdb *db, uint64_t hw, uint64_t page, int depth, int *err)
+{
+    if (depth > 64) {
+        *err = QSDB_CORRUPT;
+        return 0;
+    }
+    Page scratch;
+    const uint8_t *p = 0;
+    *err = view_page(db, page, hw, &p, &scratch);
+    if (*err)
+        return 0;
+    uint16_t type = rd16(p + 16);
+    int nslots = rd16(p + 18);
+    if (type == kLeaf)
+        return static_cast<uint64_t>(nslots);
+    if (type != kInternal) {
+        *err = QSDB_CORRUPT;
+        return 0;
+    }
+    uint64_t sum = 0;
+    for (int i = 0; i <= nslots; ++i) {
+        uint64_t child = child_id_at(p, nslots, i, err);
+        if (*err)
+            return 0;
+        sum += count_keys(db, hw, child, depth + 1, err);
+        if (*err)
+            return 0;
+    }
+    return sum;
+}
+
+void sub_nkeys(qsdb_write *tx, uint64_t n, int *err)
+{
+    if (*err)
+        return;
+    if (n > tx->nkeys) {
+        *err = QSDB_CORRUPT;
+        return;
+    }
+    tx->nkeys -= n;
+}
+
+struct RDel {
+    uint64_t page = 0;
+    bool changed = false;
+    bool gone = false;
+    uint64_t removed = 0;
+    int err = 0;
+};
+
+RDel range_delete(qsdb_write *tx, uint64_t page, const uint8_t *lo, uint32_t lon,
+                  const uint8_t *hi, uint32_t hin, bool has_lo, bool has_hi, bool is_root)
+{
+    RDel d;
+    Page raw;
+    int rc = read_page(tx->db, page, tx->hw, &raw);
+    if (rc) {
+        d.err = rc;
+        return d;
+    }
+    uint16_t type = rd16(raw.b + 16);
+    int nslots = rd16(raw.b + 18);
+    if (type == kLeaf) {
+        int err = 0;
+        int lower = 0;
+        int upper = nslots;
+        if (has_lo)
+            lower = leaf_lower_bound(tx->db, tx->hw, tx->cmp, raw.b, nslots, lo, lon, &err);
+        if (!err && has_hi)
+            upper = leaf_lower_bound(tx->db, tx->hw, tx->cmp, raw.b, nslots, hi, hin, &err);
+        if (err) {
+            d.err = err;
+            return d;
+        }
+        if (upper < lower)
+            upper = lower;
+        if (lower >= upper) {
+            d.page = page;
+            return d;
+        }
+        uint64_t removed = static_cast<uint64_t>(upper - lower);
+        sub_nkeys(tx, removed, &err);
+        if (err) {
+            d.err = err;
+            return d;
+        }
+        d.removed = removed;
+        if (removed == static_cast<uint64_t>(nslots) && !is_root) {
+            d.gone = true;
+            d.changed = true;
+            d.page = 0;
+            return d;
+        }
+        std::vector<Item> items;
+        rc = load_leaf(tx->db, tx->hw, raw, &items);
+        if (rc) {
+            d.err = rc;
+            return d;
+        }
+        items.erase(items.begin() + lower, items.begin() + upper);
+        Page ignored;
+        uint64_t dest = 0;
+        rc = cow_id(tx, page, &ignored, &dest);
+        if (rc) {
+            d.err = rc;
+            return d;
+        }
+        uint64_t right = 0;
+        std::vector<uint8_t> sep;
+        rc = pack_leaf(tx, items, dest, &right, &sep);
+        if (rc || right) {
+            d.err = rc ? rc : QSDB_INVAL;
+            return d;
+        }
+        d.page = dest;
+        d.changed = true;
+        return d;
+    }
+    if (type != kInternal) {
+        d.err = QSDB_CORRUPT;
+        return d;
+    }
+    uint64_t leftmost = 0;
+    std::vector<Item> seps;
+    rc = load_internal(tx->db, tx->hw, raw, &leftmost, &seps);
+    if (rc) {
+        d.err = rc;
+        return d;
+    }
+    std::vector<Item> kept;
+    uint64_t new_left = 0;
+    bool any = false;
+    bool mutated = false;
+    for (int i = 0; i <= nslots; ++i) {
+        bool entirely_left = false;
+        bool entirely_right = false;
+        if (has_lo && i < nslots && cmp_vec(tx->cmp, seps[static_cast<size_t>(i)].key, lo, lon) <= 0)
+            entirely_left = true;
+        if (has_hi && i > 0 && cmp_vec(tx->cmp, seps[static_cast<size_t>(i - 1)].key, hi, hin) >= 0)
+            entirely_right = true;
+        bool lower_ok = !has_lo || (i > 0 && cmp_vec(tx->cmp, seps[static_cast<size_t>(i - 1)].key, lo, lon) >= 0);
+        bool upper_ok = !has_hi || (i < nslots && cmp_vec(tx->cmp, seps[static_cast<size_t>(i)].key, hi, hin) <= 0);
+        bool entirely_inside = !entirely_left && !entirely_right && lower_ok && upper_ok;
+        uint64_t child = (i == 0) ? leftmost : seps[static_cast<size_t>(i - 1)].child;
+        bool keep = true;
+        uint64_t keep_page = child;
+        if (entirely_left || entirely_right) {
+            keep = true;
+        } else if (entirely_inside) {
+            int err = 0;
+            uint64_t n = count_keys(tx->db, tx->hw, child, 0, &err);
+            if (!err)
+                sub_nkeys(tx, n, &err);
+            if (err) {
+                d.err = err;
+                return d;
+            }
+            d.removed += n;
+            keep = false;
+            mutated = true;
+        } else {
+            RDel sub = range_delete(tx, child, lo, lon, hi, hin, has_lo, has_hi, false);
+            if (sub.err) {
+                d.err = sub.err;
+                return d;
+            }
+            d.removed += sub.removed;
+            if (sub.gone) {
+                keep = false;
+                mutated = true;
+            } else if (sub.changed) {
+                keep_page = sub.page;
+                mutated = true;
+            }
+        }
+        if (!keep)
+            continue;
+        if (!any) {
+            new_left = keep_page;
+            any = true;
+        } else {
+            Item s = seps[static_cast<size_t>(i - 1)];
+            s.child = keep_page;
+            kept.push_back(std::move(s));
+        }
+    }
+    if (!any) {
+        if (!is_root) {
+            d.gone = true;
+            d.changed = true;
+            d.page = 0;
+            return d;
+        }
+        uint64_t leaf = 0;
+        rc = make_empty_leaf(tx, &leaf);
+        if (rc) {
+            d.err = rc;
+            return d;
+        }
+        d.page = leaf;
+        d.changed = true;
+        return d;
+    }
+    if (!mutated) {
+        d.page = page;
+        return d;
+    }
+    if (kept.empty()) {
+        d.page = new_left;
+        d.changed = true;
+        return d;
+    }
+    Page ignored;
+    uint64_t dest = 0;
+    rc = cow_id(tx, page, &ignored, &dest);
+    if (rc) {
+        d.err = rc;
+        return d;
+    }
+    uint64_t right = 0;
+    std::vector<uint8_t> sep;
+    uint64_t dummy = 0;
+    rc = pack_internal(tx, new_left, kept, dest, &right, &sep, &dummy);
+    if (rc || right) {
+        d.err = rc ? rc : QSDB_INVAL;
+        return d;
+    }
+    d.page = dest;
+    d.changed = true;
+    return d;
+}
+
+/* Exclusive end of a prefix. False means every larger key is still inside. */
+bool prefix_upper(uint32_t mode, const uint8_t *p, size_t n, std::vector<uint8_t> *out)
+{
+    out->assign(p, p + n);
+    if (mode == kCmpUtf16) {
+        if (n < 2 || (n % 2) != 0)
+            return false;
+        for (int i = static_cast<int>(n / 2) - 1; i >= 0; --i) {
+            uint16_t c = static_cast<uint16_t>((*out)[static_cast<size_t>(i) * 2]
+                                               | (static_cast<uint16_t>((*out)[static_cast<size_t>(i) * 2 + 1]) << 8));
+            if (c != 0xFFFFu) {
+                uint16_t nxt = static_cast<uint16_t>(c + 1);
+                (*out)[static_cast<size_t>(i) * 2] = static_cast<uint8_t>(nxt & 0xFF);
+                (*out)[static_cast<size_t>(i) * 2 + 1] = static_cast<uint8_t>(nxt >> 8);
+                return true;
+            }
+            (*out)[static_cast<size_t>(i) * 2] = 0;
+            (*out)[static_cast<size_t>(i) * 2 + 1] = 0;
+        }
+        return false;
+    }
+    for (int i = static_cast<int>(n) - 1; i >= 0; --i) {
+        if ((*out)[static_cast<size_t>(i)] != 0xFF) {
+            (*out)[static_cast<size_t>(i)] = static_cast<uint8_t>((*out)[static_cast<size_t>(i)] + 1);
+            return true;
+        }
+        (*out)[static_cast<size_t>(i)] = 0;
+    }
+    return false;
+}
+
 int finish_lock(qsdb *db, bool have_file_lock)
 {
     db->writing = false;
@@ -1403,10 +2137,14 @@ int qsdb_open(const char *path, int flags, qsdb **out)
     if (!path || !out)
         return QSDB_INVAL;
     qsdb *db = new qsdb();
-#if !defined(_WIN32)
+#if defined(_WIN32)
+    InitializeCriticalSection(&db->map_mu);
+#else
     pthread_mutex_init(&db->mu, NULL);
     db->mu_ready = true;
+    pthread_mutex_init(&db->map_mu, NULL);
 #endif
+    db->map_mu_ready = true;
     db->create_cmp = (flags & QSDB_OPEN_UTF16) ? kCmpUtf16 : kCmpBytes;
     db->readonly = (flags & QSDB_OPEN_READONLY) != 0;
     bool create = (flags & QSDB_OPEN_CREATE) != 0;
@@ -1492,11 +2230,19 @@ void qsdb_close(qsdb *db)
 {
     if (!db)
         return;
+    if (db->map_mu_ready)
+        release_maps(db);
     os_close(&db->file);
-#if !defined(_WIN32)
+#if defined(_WIN32)
+    if (db->map_mu_ready)
+        DeleteCriticalSection(&db->map_mu);
+#else
     if (db->mu_ready)
         pthread_mutex_destroy(&db->mu);
+    if (db->map_mu_ready)
+        pthread_mutex_destroy(&db->map_mu);
 #endif
+    db->map_mu_ready = false;
     delete db;
 }
 
@@ -1560,7 +2306,7 @@ int qsdb_get(qsdb_read *tx, const void *key, size_t key_len,
     if (!tx || !key || !out_len || key_len > QSDB_MAX_KEY_BYTES)
         return QSDB_INVAL;
     Item it;
-    int rc = lookup_item(tx, static_cast<const uint8_t *>(key), static_cast<uint32_t>(key_len), &it);
+    int rc = lookup_item(tx, static_cast<const uint8_t *>(key), static_cast<uint32_t>(key_len), &it, true);
     if (rc)
         return rc;
     if (tag)
@@ -1568,32 +2314,78 @@ int qsdb_get(qsdb_read *tx, const void *key, size_t key_len,
     return stream_value(tx->db, tx->high_water, it, buf, buf_cap, out_len, offset);
 }
 
-int qsdb_contains(qsdb_read *tx, const void *key, size_t key_len)
+int qsdb_get_alloc(qsdb_read *tx, const void *key, size_t key_len,
+                   uint32_t *tag, void **out_ptr, size_t *out_len)
 {
-    uint32_t tag = 0;
-    size_t n = 0;
-    return qsdb_get(tx, key, key_len, &tag, NULL, 0, &n, 0);
+    if (!out_ptr || !out_len)
+        return QSDB_INVAL;
+    *out_ptr = NULL;
+    *out_len = 0;
+    if (!tx || !key || key_len > QSDB_MAX_KEY_BYTES)
+        return QSDB_INVAL;
+    Item it;
+    int rc = lookup_item(tx, static_cast<const uint8_t *>(key), static_cast<uint32_t>(key_len), &it, true);
+    if (rc)
+        return rc;
+    if (tag)
+        *tag = it.tag;
+    uint64_t total = it.val_is_ovf ? it.val_len : it.val.size();
+    if (total > static_cast<uint64_t>(SIZE_MAX))
+        return QSDB_TOO_BIG;
+    if (total == 0)
+        return QSDB_OK;
+    void *mem = malloc(static_cast<size_t>(total));
+    if (!mem)
+        return QSDB_IO;
+    size_t got = 0;
+    rc = stream_value(tx->db, tx->high_water, it, mem, static_cast<size_t>(total), &got, 0);
+    if (rc) {
+        free(mem);
+        return rc;
+    }
+    *out_ptr = mem;
+    *out_len = got;
+    return QSDB_OK;
 }
 
-int qsdb_scan(qsdb_read *tx, const void *start, size_t start_len, qsdb_scan_fn fn, void *user)
+int qsdb_contains(qsdb_read *tx, const void *key, size_t key_len)
 {
-    if (!tx || !fn || start_len > QSDB_MAX_KEY_BYTES)
+    if (!tx || !key || key_len > QSDB_MAX_KEY_BYTES)
         return QSDB_INVAL;
+    Item it;
+    return lookup_item(tx, static_cast<const uint8_t *>(key), static_cast<uint32_t>(key_len), &it, false);
+}
+
+int qsdb_scan_range(qsdb_read *tx, const void *start, size_t start_len,
+                    const void *end, size_t end_len, qsdb_scan_fn fn, void *user)
+{
+    if (!tx || !fn || start_len > QSDB_MAX_KEY_BYTES || end_len > QSDB_MAX_KEY_BYTES)
+        return QSDB_INVAL;
+    if (start == NULL)
+        start_len = 0;
+    if (end == NULL)
+        end_len = 0;
     WalkCtx w;
     w.db = tx->db;
     w.hw = tx->high_water;
     w.cmp = tx->cmp;
     w.start = static_cast<const uint8_t *>(start);
     w.start_len = static_cast<uint32_t>(start_len);
-    w.begun = start_len == 0 && start == NULL;
+    w.end = static_cast<const uint8_t *>(end);
+    w.end_len = static_cast<uint32_t>(end_len);
+    w.has_end = end != NULL;
+    w.begun = start == NULL;
     w.fn = fn;
     w.user = user;
     w.rc = 0;
     w.stop = 0;
-    if (start == NULL)
-        w.begun = true;
     walk(&w, tx->root, 0);
     return w.rc;
+}
+
+int qsdb_scan(qsdb_read *tx, const void *start, size_t start_len, qsdb_scan_fn fn, void *user)
+{
+    return qsdb_scan_range(tx, start, start_len, NULL, 0, fn, user);
 }
 
 int qsdb_begin_write(qsdb *db, qsdb_write **out)
@@ -1703,28 +2495,20 @@ int qsdb_erase(qsdb_write *tx, const void *key, size_t key_len)
     return QSDB_OK;
 }
 
-struct Collect {
-    std::vector<std::vector<uint8_t> > keys;
-    const uint8_t *pfx;
-    size_t plen;
-    const uint8_t *sep;
-    size_t seplen;
-};
-
-int collect_cb(const void *key, size_t key_len, uint32_t, uint64_t, void *user)
+int adopt_root(qsdb_write *tx, uint64_t page, bool changed, bool gone)
 {
-    Collect *c = static_cast<Collect *>(user);
-    const uint8_t *k = static_cast<const uint8_t *>(key);
-    if (!prefix_hit(k, key_len, c->pfx, c->plen, c->sep, c->seplen)) {
-        if (c->keys.empty())
-            return 0;
-        /* scanned past the prefix */
-        if (key_len < c->plen || memcmp(k, c->pfx, c->plen) != 0)
-            return 1;
-        return 0;
+    if (!changed)
+        return QSDB_OK;
+    if (!gone && page != 0) {
+        tx->root = page;
+        return QSDB_OK;
     }
-    c->keys.push_back(std::vector<uint8_t>(k, k + key_len));
-    return 0;
+    uint64_t leaf = 0;
+    int rc = make_empty_leaf(tx, &leaf);
+    if (rc)
+        return rc;
+    tx->root = leaf;
+    return QSDB_OK;
 }
 
 int qsdb_erase_tree(qsdb_write *tx, const void *key, size_t key_len,
@@ -1732,30 +2516,32 @@ int qsdb_erase_tree(qsdb_write *tx, const void *key, size_t key_len,
 {
     if (!tx || !tx->active || !key || key_len == 0 || !sep || sep_len == 0)
         return QSDB_INVAL;
-    /* Scan using a temporary read view of the current write image. */
-    qsdb_read view;
-    view.db = tx->db;
-    view.root = tx->root;
-    view.high_water = tx->hw;
-    view.generation = 0;
-    view.cmp = tx->cmp;
-    Collect col;
-    col.pfx = static_cast<const uint8_t *>(key);
-    col.plen = key_len;
-    col.sep = static_cast<const uint8_t *>(sep);
-    col.seplen = sep_len;
-    int rc = qsdb_scan(&view, key, key_len, collect_cb, &col);
+    if (key_len > QSDB_MAX_KEY_BYTES || sep_len > QSDB_MAX_KEY_BYTES
+        || key_len > QSDB_MAX_KEY_BYTES - sep_len)
+        return QSDB_TOO_BIG;
+    const uint8_t *kb = static_cast<const uint8_t *>(key);
+    Del exact = delete_page(tx, tx->root, kb, static_cast<uint32_t>(key_len), true);
+    if (del_err(exact))
+        return static_cast<int>(exact.page);
+    int rc = adopt_root(tx, exact.page, exact.changed, exact.gone);
     if (rc)
         return rc;
-    if (col.keys.empty())
+    std::vector<uint8_t> lo;
+    lo.reserve(key_len + sep_len);
+    lo.insert(lo.end(), kb, kb + key_len);
+    lo.insert(lo.end(), static_cast<const uint8_t *>(sep), static_cast<const uint8_t *>(sep) + sep_len);
+    std::vector<uint8_t> hi;
+    bool has_hi = prefix_upper(tx->cmp, lo.data(), lo.size(), &hi);
+    RDel range = range_delete(tx, tx->root, lo.data(), static_cast<uint32_t>(lo.size()),
+                              has_hi ? hi.data() : 0, has_hi ? static_cast<uint32_t>(hi.size()) : 0,
+                              true, has_hi, true);
+    if (range.err)
+        return range.err;
+    rc = adopt_root(tx, range.page, range.changed, range.gone);
+    if (rc)
+        return rc;
+    if (!exact.changed && range.removed == 0)
         return QSDB_NOT_FOUND;
-    for (size_t i = 0; i < col.keys.size(); ++i) {
-        rc = qsdb_erase(tx, col.keys[i].data(), col.keys[i].size());
-        if (rc && rc != QSDB_NOT_FOUND)
-            return rc;
-        view.root = tx->root;
-        view.high_water = tx->hw;
-    }
     return QSDB_OK;
 }
 
@@ -1786,6 +2572,7 @@ int qsdb_commit(qsdb_write *tx)
     else
         rc = os_fsync(&db->file);
     if (rc) {
+        unmap_beyond(db, tx->base_physical);
         os_truncate(&db->file, tx->base_physical);
         db->physical = tx->base_physical;
         tx->active = false;
@@ -1873,6 +2660,7 @@ void qsdb_abort(qsdb_write *tx)
     if (!tx || !tx->active)
         return;
     qsdb *db = tx->db;
+    unmap_beyond(db, tx->base_physical);
     os_truncate(&db->file, tx->base_physical);
     db->physical = tx->base_physical;
     tx->active = false;
@@ -1900,4 +2688,26 @@ void qsdb_debug_max_bytes(qsdb *db, uint64_t bytes)
 {
     if (db)
         db->max_bytes = bytes;
+}
+
+uint64_t qsdb_debug_root(qsdb *db)
+{
+    return db ? db->committed.root : 0;
+}
+
+int qsdb_debug_page_mapped(qsdb *db, uint64_t page_id)
+{
+    if (!db)
+        return 0;
+    uint64_t win = page_id / kWinPages;
+    map_lock(db);
+    int mapped = 0;
+    if (win < db->maps.size()) {
+        const MapWin &w = db->maps[static_cast<size_t>(win)];
+        uint64_t within = page_id - win * kWinPages;
+        if (w.addr && within < w.pages)
+            mapped = 1;
+    }
+    map_unlock(db);
+    return mapped;
 }
