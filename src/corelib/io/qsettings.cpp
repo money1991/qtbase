@@ -294,10 +294,55 @@ after_loop:
 
 // see also qsettings_win.cpp, qsettings_winrt.cpp and qsettings_mac.cpp
 
+static Path getPath(QSettings::Format format, QSettings::Scope scope);
+
+QStringList qsettingsStorageFiles(QSettings::Format format, QSettings::Scope scope,
+                                  const QString &organization, const QString &application)
+{
+    QString extension = (format == QSettings::NativeFormat)
+            ? QLatin1String(".conf") : QLatin1String(".ini");
+    QString org = organization.isEmpty() ? QString(QLatin1String("Unknown Organization")) : organization;
+    QString appFile = org + QDir::separator() + application + extension;
+    QString orgFile = org + extension;
+    QStringList files;
+
+    if (scope == QSettings::UserScope) {
+        Path userPath = getPath(format, QSettings::UserScope);
+        if (!application.isEmpty())
+            files.append(userPath.path + appFile);
+        files.append(userPath.path + orgFile);
+    }
+
+    Path systemPath = getPath(format, QSettings::SystemScope);
+#if defined(Q_XDG_PLATFORM) && !defined(QT_NO_STANDARDPATHS)
+    if (!systemPath.userDefined) {
+        QStringList dirs = QStandardPaths::standardLocations(QStandardPaths::GenericConfigLocation);
+        if (!dirs.isEmpty())
+            dirs.takeFirst();
+        if (!application.isEmpty()) {
+            for (int i = 0; i < dirs.size(); ++i)
+                files.append(dirs.at(i) + QLatin1Char('/') + appFile);
+        }
+        for (int i = 0; i < dirs.size(); ++i)
+            files.append(dirs.at(i) + QLatin1Char('/') + orgFile);
+    } else
+#endif
+    {
+        if (!application.isEmpty())
+            files.append(systemPath.path + appFile);
+        files.append(systemPath.path + orgFile);
+    }
+    return files;
+}
+
 #if !defined(Q_OS_WIN) && !defined(Q_OS_MAC)
 QSettingsPrivate *QSettingsPrivate::create(QSettings::Format format, QSettings::Scope scope,
                                            const QString &organization, const QString &application)
 {
+#ifndef QT_BOOTSTRAPPED
+    if (QSettingsPrivate *qsdb = qsdbCreateIfEnabled(format, scope, organization, application))
+        return qsdb;
+#endif
     return new QConfFileSettingsPrivate(format, scope, organization, application);
 }
 #endif
@@ -305,6 +350,10 @@ QSettingsPrivate *QSettingsPrivate::create(QSettings::Format format, QSettings::
 #if !defined(Q_OS_WIN)
 QSettingsPrivate *QSettingsPrivate::create(const QString &fileName, QSettings::Format format)
 {
+#ifndef QT_BOOTSTRAPPED
+    if (QSettingsPrivate *qsdb = qsdbCreateFileIfEnabled(fileName, format))
+        return qsdb;
+#endif
     return new QConfFileSettingsPrivate(fileName, format);
 }
 #endif

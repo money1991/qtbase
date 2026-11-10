@@ -299,6 +299,12 @@ private:
     int nextPosition;
 };
 
+QStringList qsettingsStorageFiles(QSettings::Format format, QSettings::Scope scope,
+                                  const QString &organization, const QString &application);
+QSettingsPrivate *qsdbCreateIfEnabled(QSettings::Format format, QSettings::Scope scope,
+                                      const QString &organization, const QString &application);
+QSettingsPrivate *qsdbCreateFileIfEnabled(const QString &fileName, QSettings::Format format);
+
 QT_END_NAMESPACE
 
 #endif // QSETTINGS_P_H

@@ -47,6 +47,8 @@
 // include stdlib.h and hope that it defines __GLIBC__ for glibc-based systems
 #include <stdlib.h>
 #include <string.h>
+/* g++ 13 no longer includes <limits> transitively; numeric_limits is used below. */
+#include <limits>
 
 #ifdef min // MSVC
 #undef min

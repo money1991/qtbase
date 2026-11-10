@@ -119,11 +119,15 @@ qtConfig(processenvironment) {
 }
 
 qtConfig(settings) {
+    INCLUDEPATH += $$PWD/../../../qsdb/include
     SOURCES += \
-        io/qsettings.cpp
+        io/qsettings.cpp \
+        io/qsettings_qsdb.cpp \
+        $$PWD/../../../qsdb/src/qsdb.cpp
     HEADERS += \
         io/qsettings.h \
-        io/qsettings_p.h
+        io/qsettings_p.h \
+        $$PWD/../../../qsdb/include/qsdb.h
 
     win32 {
         !winrt {

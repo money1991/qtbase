@@ -63,26 +63,29 @@ QByteArray qt_readlink(const char *path)
 #  define PATH_MAX  1024*1024
 #endif
 
-    QByteArray buf(256, Qt::Uninitialized);
-
-    ssize_t len = ::readlink(path, buf.data(), buf.size());
-    while (len == buf.size()) {
-        // readlink(2) will fill our buffer and not necessarily terminate with NUL;
-        if (buf.size() >= PATH_MAX) {
+    /* glibc FORTIFY_SOURCE=3 treats QByteArray::data() as the 1-byte
+     * QArrayData tail and aborts readlink(). Use a real array. */
+    size_t cap = 256;
+    char *tmp = new char[cap];
+    ssize_t len = ::readlink(path, tmp, cap);
+    while (len == static_cast<ssize_t>(cap)) {
+        if (cap >= PATH_MAX) {
+            delete [] tmp;
             errno = ENAMETOOLONG;
             return QByteArray();
         }
-
-        // double the size and try again
-        buf.resize(buf.size() * 2);
-        len = ::readlink(path, buf.data(), buf.size());
+        delete [] tmp;
+        cap *= 2;
+        tmp = new char[cap];
+        len = ::readlink(path, tmp, cap);
     }
-
-    if (len == -1)
+    if (len < 0) {
+        delete [] tmp;
         return QByteArray();
-
-    buf.resize(len);
-    return buf;
+    }
+    QByteArray out(tmp, int(len));
+    delete [] tmp;
+    return out;
 }
 
 #if defined(Q_PROCESSOR_X86_32) && defined(__GLIBC__)

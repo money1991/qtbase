@@ -843,6 +843,8 @@ QSettingsPrivate *QSettingsPrivate::create(QSettings::Format format, QSettings::
     default:
         break;
     }
+    if (QSettingsPrivate *qsdb = qsdbCreateIfEnabled(format, scope, organization, application))
+        return qsdb;
     return new QConfFileSettingsPrivate(format, scope, organization, application);
 }
 
@@ -858,6 +860,8 @@ QSettingsPrivate *QSettingsPrivate::create(const QString &fileName, QSettings::F
     default:
         break;
     }
+    if (QSettingsPrivate *qsdb = qsdbCreateFileIfEnabled(fileName, format))
+        return qsdb;
     return new QConfFileSettingsPrivate(fileName, format);
 }
 
