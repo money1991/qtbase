@@ -4,6 +4,8 @@
 # libdir, when set, is prepended to LD_LIBRARY_PATH so the same driver can be
 # timed against another build of QtCore. fresh_* rows are new processes with
 # a warm OS page cache, not a dropped-cache disk read.
+# Kill tests keep the kernel page cache. They are not a hardware power-loss test.
+# ASan/UBSan/TSan are separate g++ -fsanitize builds of qsdb/tests/test_qsdb.cpp.
 set -eu
 QMAKE=$1
 INI=$2

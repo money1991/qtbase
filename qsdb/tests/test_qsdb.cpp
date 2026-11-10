@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <pthread.h>
+#include <signal.h>
 
 #if !defined(_WIN32)
 #  include <sys/wait.h>
@@ -254,6 +256,22 @@ static void test_random_oracle(const char *path)
             } else if (op == 2 && (seed % 7) == 0) {
                 expect(qsdb_clear(w) == QSDB_OK, "clear rnd");
                 oracle.clear();
+            } else if (op == 4 && (seed % 11) == 0) {
+                char digit = static_cast<char>('0' + static_cast<int>(seed % 10));
+                int rc = qsdb_erase_tree(w, "k", 1, &digit, 1);
+                std::string lo = std::string("k") + digit;
+                std::string hi = lo;
+                hi[1] = static_cast<char>(hi[1] + 1);
+                bool any = false;
+                for (std::map<std::string, std::string>::iterator it = oracle.begin(); it != oracle.end();) {
+                    if (it->first >= lo && it->first < hi) {
+                        any = true;
+                        oracle.erase(it++);
+                    } else {
+                        ++it;
+                    }
+                }
+                expect(rc == (any ? QSDB_OK : QSDB_NOT_FOUND), "oracle range");
             }
         }
         expect(qsdb_commit(w) == QSDB_OK, "commit rnd");
@@ -733,6 +751,349 @@ static void test_million(const char *path)
     qsdb_close(db);
 }
 
+static void copy_file(const char *from, const char *to)
+{
+    FILE *in = fopen(from, "rb");
+    FILE *out = fopen(to, "wb");
+    expect(in && out, "copy open");
+    if (!in || !out) {
+        if (in)
+            fclose(in);
+        if (out)
+            fclose(out);
+        return;
+    }
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0)
+        fwrite(buf, 1, n, out);
+    fclose(in);
+    fclose(out);
+}
+
+static void test_poison_and_continue(const char *path)
+{
+    unlink(path);
+    qsdb *db = NULL;
+    expect(qsdb_open(path, QSDB_OPEN_CREATE, &db) == QSDB_OK, "poison open");
+    qsdb_write *w = NULL;
+    qsdb_begin_write(db, &w);
+    put_str(w, "base", "B");
+    expect(qsdb_commit(w) == QSDB_OK, "poison seed");
+    expect(qsdb_begin_write(db, &w) == QSDB_OK, "poison w");
+    put_str(w, "small", "S");
+    qsdb_stat st;
+    qsdb_info(db, &st);
+    qsdb_debug_max_bytes(db, st.physical_bytes);
+    std::string huge(200000, 'H');
+    int rc = qsdb_put(w, "huge", 4, QSDB_TAG_BYTES, huge.data(), huge.size());
+    expect(rc == QSDB_NOSPC, "poison put nospace");
+    expect(qsdb_commit(w) != QSDB_OK, "poisoned txn cannot commit");
+    qsdb_abort(w);
+    qsdb_debug_max_bytes(db, 0);
+    qsdb_read *r = NULL;
+    qsdb_begin_read(db, &r);
+    expect(get_str(r, "base") == "B", "base survived poison");
+    expect(get_str(r, "small") == "<missing>", "uncommitted small discarded");
+    qsdb_end_read(r);
+    qsdb_begin_write(db, &w);
+    put_str(w, "small", "S");
+    expect(qsdb_commit(w) == QSDB_OK, "write after abort");
+    qsdb_begin_read(db, &r);
+    expect(get_str(r, "small") == "S", "small committed later");
+    qsdb_end_read(r);
+    qsdb_close(db);
+}
+
+static void test_uncertain_continue(const char *path)
+{
+    unlink(path);
+    qsdb *db = NULL;
+    expect(qsdb_open(path, QSDB_OPEN_CREATE, &db) == QSDB_OK, "unc2 open");
+    qsdb_write *w = NULL;
+    qsdb_begin_write(db, &w);
+    put_str(w, "a", "A");
+    expect(qsdb_commit(w) == QSDB_OK, "unc2 a");
+    qsdb_debug_fail_fsync(db, 2);
+    qsdb_begin_write(db, &w);
+    put_str(w, "b", "B");
+    expect(qsdb_commit(w) == QSDB_UNCERTAIN, "meta fsync uncertain");
+    qsdb_debug_fail_fsync(db, 0);
+    qsdb_begin_write(db, &w);
+    put_str(w, "c", "C");
+    expect(qsdb_commit(w) == QSDB_OK, "commit after uncertain");
+    qsdb_read *r = NULL;
+    qsdb_begin_read(db, &r);
+    expect(get_str(r, "a") == "A" && get_str(r, "b") == "B" && get_str(r, "c") == "C",
+           "uncertain commit stayed visible and later write appended");
+    qsdb_end_read(r);
+    qsdb_close(db);
+
+    /* Byte image from before the uncertain commit. This is a process-visible
+     * copy, not a disk losing a write after fsync. */
+    unlink(path);
+    expect(qsdb_open(path, QSDB_OPEN_CREATE, &db) == QSDB_OK, "unc3 open");
+    char side[640];
+    snprintf(side, sizeof side, "%s.side", path);
+    qsdb_begin_write(db, &w);
+    put_str(w, "a", "A");
+    expect(qsdb_commit(w) == QSDB_OK, "unc3 a");
+    qsdb_close(db);
+    copy_file(path, side);
+    expect(qsdb_open(path, 0, &db) == QSDB_OK, "unc3 reopen");
+    qsdb_debug_fail_fsync(db, 2);
+    qsdb_begin_write(db, &w);
+    put_str(w, "b", "B");
+    expect(qsdb_commit(w) == QSDB_UNCERTAIN, "unc3 uncertain");
+    qsdb_close(db);
+    copy_file(side, path);
+    unlink(side);
+    expect(qsdb_open(path, 0, &db) == QSDB_OK, "unc3 restored");
+    qsdb_begin_read(db, &r);
+    expect(get_str(r, "a") == "A", "restored image keeps a");
+    expect(get_str(r, "b") == "<missing>", "restored image drops uncertain b");
+    qsdb_end_read(r);
+    qsdb_begin_write(db, &w);
+    put_str(w, "c", "C");
+    expect(qsdb_commit(w) == QSDB_OK, "write after restored image");
+    qsdb_begin_read(db, &r);
+    expect(get_str(r, "a") == "A" && get_str(r, "c") == "C", "continue after lost meta");
+    qsdb_end_read(r);
+    qsdb_close(db);
+}
+
+static void test_truncated_and_slots(const char *path)
+{
+    unlink(path);
+    qsdb *db = NULL;
+    expect(qsdb_open(path, QSDB_OPEN_CREATE, &db) == QSDB_OK, "slot open");
+    qsdb_write *w = NULL;
+    qsdb_begin_write(db, &w);
+    put_str(w, "a", "A");
+    expect(qsdb_commit(w) == QSDB_OK, "slot a");
+    qsdb_close(db);
+    FILE *f = fopen(path, "r+b");
+    expect(f != NULL, "slot file");
+    if (f) {
+        /* First user commit publishes slot 1. Damage that slot. */
+        fseek(f, 4096 + 80, SEEK_SET);
+        int b = fgetc(f);
+        fseek(f, 4096 + 80, SEEK_SET);
+        fputc(b ^ 0x11, f);
+        fclose(f);
+    }
+    expect(qsdb_open(path, 0, &db) == QSDB_OK, "older slot still opens");
+    qsdb_read *r = NULL;
+    qsdb_begin_read(db, &r);
+    expect(get_str(r, "a") == "<missing>", "damaged newer slot falls back to empty root");
+    qsdb_end_read(r);
+    qsdb_close(db);
+
+    f = fopen(path, "r+b");
+    if (f) {
+        fseek(f, 80, SEEK_SET);
+        int b = fgetc(f);
+        fseek(f, 80, SEEK_SET);
+        fputc(b ^ 0x22, f);
+        fclose(f);
+    }
+    expect(qsdb_open(path, 0, &db) != QSDB_OK, "both metadata slots damaged");
+
+    unlink(path);
+    expect(qsdb_open(path, QSDB_OPEN_CREATE, &db) == QSDB_OK, "trunc open");
+    qsdb_begin_write(db, &w);
+    put_str(w, "a", "A");
+    expect(qsdb_commit(w) == QSDB_OK, "trunc seed");
+    qsdb_close(db);
+    expect(truncate(path, 100) == 0, "truncate file");
+    expect(qsdb_open(path, 0, &db) != QSDB_OK, "truncated file is not a valid database");
+}
+
+static void test_generation_and_eintr(const char *path)
+{
+    unlink(path);
+    qsdb *db = NULL;
+    expect(qsdb_open(path, QSDB_OPEN_CREATE, &db) == QSDB_OK, "gen open");
+    qsdb_write *w = NULL;
+    qsdb_begin_write(db, &w);
+    put_str(w, "a", "A");
+    expect(qsdb_commit(w) == QSDB_OK, "gen a");
+    qsdb_begin_write(db, &w);
+    put_str(w, "b", "B");
+    qsdb_debug_force_generation(db, ~uint64_t(0));
+    expect(qsdb_commit(w) == QSDB_INVAL, "generation does not wrap");
+    qsdb_abort(w);
+    qsdb_read *r = NULL;
+    qsdb_begin_read(db, &r);
+    expect(get_str(r, "a") == "A" && get_str(r, "b") == "<missing>", "wrap rejected");
+    qsdb_end_read(r);
+    qsdb_debug_eintr_fsync(db, 5);
+    qsdb_begin_write(db, &w);
+    put_str(w, "c", "C");
+    expect(qsdb_commit(w) == QSDB_OK, "fsync retries EINTR");
+    qsdb_begin_read(db, &r);
+    expect(get_str(r, "c") == "C", "eintr commit visible");
+    qsdb_end_read(r);
+    qsdb_close(db);
+}
+
+static void test_abort_reader_and_overflow_range(const char *path)
+{
+    unlink(path);
+    qsdb *db = NULL;
+    expect(qsdb_open(path, QSDB_OPEN_CREATE, &db) == QSDB_OK, "abr open");
+    qsdb_write *w = NULL;
+    qsdb_begin_write(db, &w);
+    put_str(w, "keep", "K");
+    expect(qsdb_commit(w) == QSDB_OK, "abr seed");
+    qsdb_read *old = NULL;
+    qsdb_begin_read(db, &old);
+    qsdb_begin_write(db, &w);
+    expect(put_n(w, "t%05d", 0, 3000) == QSDB_OK, "abr grow");
+    qsdb_abort(w);
+    expect(get_str(old, "keep") == "K", "reader survives abort of a growing txn");
+    expect(get_str(old, "t00000") == "<missing>", "aborted keys stay invisible");
+    qsdb_end_read(old);
+    qsdb_begin_read(db, &old);
+    expect(get_str(old, "keep") == "K", "reopen snapshot after abort");
+    qsdb_end_read(old);
+
+    std::string longkey(600, 'p');
+    std::string child = longkey + "/a";
+    std::string cousin = longkey + "bar";
+    qsdb_begin_write(db, &w);
+    expect(qsdb_put(w, longkey.data(), longkey.size(), QSDB_TAG_BYTES, "L", 1) == QSDB_OK, "ovf put");
+    expect(qsdb_put(w, child.data(), child.size(), QSDB_TAG_BYTES, "C", 1) == QSDB_OK, "ovf child");
+    expect(qsdb_put(w, cousin.data(), cousin.size(), QSDB_TAG_BYTES, "B", 1) == QSDB_OK, "ovf cousin");
+    expect(qsdb_commit(w) == QSDB_OK, "ovf commit");
+    qsdb_begin_write(db, &w);
+    expect(qsdb_erase_tree(w, longkey.data(), longkey.size(), "/", 1) == QSDB_OK, "ovf erase");
+    expect(qsdb_commit(w) == QSDB_OK, "ovf erase commit");
+    qsdb_read *r = NULL;
+    qsdb_begin_read(db, &r);
+    uint32_t tag = 0;
+    size_t n = 0;
+    expect(qsdb_get(r, longkey.data(), longkey.size(), &tag, NULL, 0, &n, 0) == QSDB_NOT_FOUND, "long key gone");
+    expect(qsdb_get(r, child.data(), child.size(), &tag, NULL, 0, &n, 0) == QSDB_NOT_FOUND, "long child gone");
+    expect(qsdb_get(r, cousin.data(), cousin.size(), &tag, NULL, 0, &n, 0) == QSDB_OK, "long cousin kept");
+    expect(get_str(r, "keep") == "K", "keep still there");
+    qsdb_end_read(r);
+    qsdb_close(db);
+}
+
+struct Thr {
+    qsdb *db;
+    int bad;
+};
+
+static void *thr_read(void *arg)
+{
+    Thr *t = static_cast<Thr *>(arg);
+    for (int i = 0; i < 40; ++i) {
+        qsdb_read *r = NULL;
+        if (qsdb_begin_read(t->db, &r) != QSDB_OK) {
+            t->bad++;
+            continue;
+        }
+        std::string v = get_str(r, "k");
+        if (v.size() < 2 || v[0] != 'v')
+            t->bad++;
+        qsdb_end_read(r);
+    }
+    return NULL;
+}
+
+static void test_threads_and_two_writers(const char *path)
+{
+    unlink(path);
+    qsdb *db = NULL;
+    expect(qsdb_open(path, QSDB_OPEN_CREATE, &db) == QSDB_OK, "thr open");
+    qsdb_write *w = NULL;
+    qsdb_begin_write(db, &w);
+    put_str(w, "k", "v0");
+    expect(qsdb_commit(w) == QSDB_OK, "thr seed");
+    Thr thr;
+    thr.db = db;
+    thr.bad = 0;
+    pthread_t th;
+    expect(pthread_create(&th, NULL, thr_read, &thr) == 0, "thread");
+    for (int i = 1; i <= 20; ++i) {
+        char val[16];
+        snprintf(val, sizeof val, "v%d", i);
+        qsdb_begin_write(db, &w);
+        put_str(w, "k", val);
+        expect(qsdb_commit(w) == QSDB_OK, "thr commit");
+    }
+    pthread_join(th, NULL);
+    expect(thr.bad == 0, "concurrent readers saw whole values");
+    qsdb_close(db);
+
+    expect(qsdb_open(path, QSDB_OPEN_CREATE, &db) == QSDB_OK, "lock open");
+    qsdb_begin_write(db, &w);
+    put_str(w, "held", "H");
+    pid_t pid = fork();
+    expect(pid >= 0, "lock fork");
+    if (pid == 0) {
+        alarm(2);
+        qsdb *c = NULL;
+        if (qsdb_open(path, 0, &c) != QSDB_OK)
+            _exit(2);
+        qsdb_write *cw = NULL;
+        int rc = qsdb_begin_write(c, &cw);
+        _exit(rc == QSDB_OK ? 0 : 3);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    expect(WIFSIGNALED(status) && WTERMSIG(status) == SIGALRM, "second process blocks on the write lock");
+    expect(qsdb_commit(w) == QSDB_OK, "holder commits");
+    pid = fork();
+    if (pid == 0) {
+        qsdb *c = NULL;
+        if (qsdb_open(path, 0, &c) != QSDB_OK)
+            _exit(2);
+        qsdb_write *cw = NULL;
+        if (qsdb_begin_write(c, &cw) != QSDB_OK)
+            _exit(3);
+        if (qsdb_put(cw, "other", 5, QSDB_TAG_BYTES, "O", 1) != QSDB_OK)
+            _exit(4);
+        if (qsdb_commit(cw) != QSDB_OK)
+            _exit(5);
+        _exit(0);
+    }
+    waitpid(pid, &status, 0);
+    expect(WIFEXITED(status) && WEXITSTATUS(status) == 0, "writer after unlock");
+    qsdb_read *r = NULL;
+    qsdb_begin_read(db, &r);
+    expect(get_str(r, "held") == "H" && get_str(r, "other") == "O", "both writers visible");
+    qsdb_end_read(r);
+    qsdb_close(db);
+}
+
+static void test_kill_then_continue(const char *dir)
+{
+    fprintf(stderr, "model=process_crash_keeps_page_cache not_hardware_power_loss\n");
+    unsigned seed = 99;
+    for (int i = 0; i < 8; ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        int phase = 1 + static_cast<int>(seed % 4);
+        char path[512];
+        snprintf(path, sizeof path, "%s/qsdb-kill-%d.db", dir, i);
+        test_crash(path, phase, phase == QSDB_CRASH_AFTER_META_FSYNC ? 1 : 0);
+        qsdb *db = NULL;
+        expect(qsdb_open(path, 0, &db) == QSDB_OK, "continue after kill");
+        qsdb_write *w = NULL;
+        expect(qsdb_begin_write(db, &w) == QSDB_OK, "continue write");
+        put_str(w, "after", "Y");
+        expect(qsdb_commit(w) == QSDB_OK, "continue commit");
+        qsdb_read *r = NULL;
+        qsdb_begin_read(db, &r);
+        expect(get_str(r, "old") == "O", "old key after continued write");
+        expect(get_str(r, "after") == "Y", "new key after continued write");
+        qsdb_end_read(r);
+        qsdb_close(db);
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = argc > 1 ? argv[1] : "/tmp";
@@ -755,6 +1116,19 @@ int main(int argc, char **argv)
     test_crc_and_fork(path);
     snprintf(path, sizeof path, "%s/qsdb-unc.db", dir);
     test_uncertain(path);
+    snprintf(path, sizeof path, "%s/qsdb-poison.db", dir);
+    test_poison_and_continue(path);
+    snprintf(path, sizeof path, "%s/qsdb-unc2.db", dir);
+    test_uncertain_continue(path);
+    snprintf(path, sizeof path, "%s/qsdb-slot.db", dir);
+    test_truncated_and_slots(path);
+    snprintf(path, sizeof path, "%s/qsdb-gen.db", dir);
+    test_generation_and_eintr(path);
+    snprintf(path, sizeof path, "%s/qsdb-abr.db", dir);
+    test_abort_reader_and_overflow_range(path);
+    snprintf(path, sizeof path, "%s/qsdb-thr.db", dir);
+    test_threads_and_two_writers(path);
+    test_kill_then_continue(dir);
     struct {
         int phase;
         int expect_new;

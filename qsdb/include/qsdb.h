@@ -11,11 +11,23 @@
  * This is not a production database: freed pages are not reclaimed online,
  * so repeated updates grow the file until an offline rebuild.
  *
- * Readers may map fixed, already-allocated windows of the file read-only.
- * A window is never extended in place. Growth appends, then a later read
- * maps only the newly complete windows. Windows has the same shape
- * (CreateFileMapping of an existing range, PAGE_READONLY) and is not
- * exercised by the Linux tests.
+ * Readers may map fixed windows that lie entirely inside the published
+ * high-water mark. A window is never extended in place, and bytes past the
+ * published prefix are read with pread so a failed transaction can drop
+ * its extension without unmapping another process's view of old pages.
+ * Windows has the same shape (CreateFileMapping of an existing range,
+ * PAGE_READONLY) and is not exercised by the Linux tests.
+ *
+ * What a process crash means here: after this process dies, a later open
+ * sees either the previous root or the new root, not a mix, as long as the
+ * kernel retains writes that fsync already reported as successful. The
+ * in-process kill tests check that. They do not drop the page cache and
+ * they are not a power-loss test. Power loss is the same protocol only if
+ * the device honors fsync; that was not measured on hardware.
+ *
+ * QSDB_UNCERTAIN means the new metadata may or may not be visible. This
+ * process will not reuse those page ids. It is not a promise that a crash
+ * plus a disk that reorders writes will still land on one of the two roots.
  */
 
 #include <stddef.h>
@@ -124,6 +136,10 @@ void qsdb_abort(qsdb_write *tx);
 void qsdb_debug_crash_at(qsdb *db, int phase);
 void qsdb_debug_fail_fsync(qsdb *db, int which); /* 1 data fsync, 2 meta fsync */
 void qsdb_debug_max_bytes(qsdb *db, uint64_t bytes); /* 0 = no limit */
+/* The next N fsync calls behave as if they returned EINTR, then a real fsync runs. */
+void qsdb_debug_eintr_fsync(qsdb *db, int times);
+/* Next commit uses this generation as the current one. UINT64_MAX must fail. */
+void qsdb_debug_force_generation(qsdb *db, uint64_t generation);
 uint64_t qsdb_debug_root(qsdb *db);
 /* 1 if this page is inside a live read-only window, else 0. */
 int qsdb_debug_page_mapped(qsdb *db, uint64_t page_id);

@@ -267,19 +267,28 @@ static int freshOne(const QString &kind, const QString &path, const QString &key
     const uint64_t t4 = mono();
     s->contains(key);
     const uint64_t t5 = mono();
+    s->childKeys();
+    const uint64_t t6 = mono();
+    s->childGroups();
+    const uint64_t t7 = mono();
+    s->allKeys();
+    const uint64_t t8 = mono();
     const int status = int(s->status());
     delete s;
-    printf("construct_ns=%llu\nfirst_value_ns=%llu\nsecond_value_ns=%llu\nmiss_ns=%llu\ncontains_ns=%llu\nstatus=%d\nvalid=%d\n",
+    printf("construct_ns=%llu\nfirst_value_ns=%llu\nsecond_value_ns=%llu\nmiss_ns=%llu\ncontains_ns=%llu\nchildkeys_ns=%llu\nchildgroups_ns=%llu\nallkeys_ns=%llu\nstatus=%d\nvalid=%d\n",
            (unsigned long long)(t1 - t0), (unsigned long long)(t2 - t1),
            (unsigned long long)(t3 - t2), (unsigned long long)(t4 - t3),
-           (unsigned long long)(t5 - t4), status, int(first.isValid() && second.isValid()));
+           (unsigned long long)(t5 - t4), (unsigned long long)(t6 - t5),
+           (unsigned long long)(t7 - t6), (unsigned long long)(t8 - t7),
+           status, int(first.isValid() && second.isValid()));
     return status == int(QSettings::NoError) ? 0 : 2;
 }
 
 static int runFresh(const QString &exe, const QString &kind, const QString &path, const QString &key,
                     std::vector<uint64_t> *construct, std::vector<uint64_t> *first,
                     std::vector<uint64_t> *second, std::vector<uint64_t> *miss,
-                    std::vector<uint64_t> *contains)
+                    std::vector<uint64_t> *contains, std::vector<uint64_t> *childKeys,
+                    std::vector<uint64_t> *childGroups, std::vector<uint64_t> *allKeys)
 {
     for (int i = 0; i < 21; ++i) {
         QProcess child;
@@ -287,16 +296,20 @@ static int runFresh(const QString &exe, const QString &kind, const QString &path
         if (!child.waitForFinished(120000) || child.exitCode() != 0)
             return 2;
         const QString text = QString::fromUtf8(child.readAllStandardOutput());
-        uint64_t a = 0, b = 0, c = 0, d = 0, e = 0;
+        uint64_t a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0, h = 0;
         if (!fieldNs(text, "construct_ns", &a) || !fieldNs(text, "first_value_ns", &b)
             || !fieldNs(text, "second_value_ns", &c) || !fieldNs(text, "miss_ns", &d)
-            || !fieldNs(text, "contains_ns", &e))
+            || !fieldNs(text, "contains_ns", &e) || !fieldNs(text, "childkeys_ns", &f)
+            || !fieldNs(text, "childgroups_ns", &g) || !fieldNs(text, "allkeys_ns", &h))
             return 3;
         construct->push_back(a);
         first->push_back(b);
         second->push_back(c);
         miss->push_back(d);
         contains->push_back(e);
+        childKeys->push_back(f);
+        childGroups->push_back(g);
+        allKeys->push_back(h);
     }
     return 0;
 }
@@ -322,10 +335,12 @@ static int bench(const QString &iniPath, const QString &dbPath, const QString &o
         note << "median=sorted[n/2]\n";
         note << "p95=sorted[(n-1)*95/100]\n";
         note << "first_us=sample 0 before sorting, so it is the first call in that process\n";
-        note << "fresh_*=new process, no in-process QSettings cache. OS page cache is warm. This is not a cold-disk number.\n";
         note << "reuse_construct=second QSettings on the same path while the first object is still alive\n";
-        note << "hot_*=calls on that already-open object, after one untimed value() warmup\n";
-        note << "pure_set_existing=setValue only. rmw_set_existing=value()+setValue of the same string\n";
+        note << "hot_*=already-open object after one untimed allKeys, so published pages are checksum-cached\n";
+        note << "pure_set_existing_uncommitted=setValue only, no read, each trial a different existing key\n";
+        note << "rmw_committed_hot=value() of a key not in the pending overlay, then setValue of that same string\n";
+        note << "fresh_*=new process, OS page cache warm, not a dropped-cache disk read\n";
+        note << "fresh enums run after first value/contains in that same process\n";
         note << "open/restore is outside remove, clear, and sync timers\n";
         note << "import parse is not included in any get number\n";
     }
@@ -364,9 +379,11 @@ static int bench(const QString &iniPath, const QString &dbPath, const QString &o
         QFile::copy(targets[t].path, pristine);
 
         std::vector<uint64_t> freshOpen, freshFirst, freshSecond, freshMiss, freshContains;
+        std::vector<uint64_t> freshChildKeys, freshChildGroups, freshAllKeys;
         const int fr = runFresh(exe, targets[t].qsdb ? QStringLiteral("qsdb") : QStringLiteral("ini"),
                                 targets[t].path, hitKey, &freshOpen, &freshFirst, &freshSecond,
-                                &freshMiss, &freshContains);
+                                &freshMiss, &freshContains, &freshChildKeys, &freshChildGroups,
+                                &freshAllKeys);
         if (fr)
             return 10 + fr;
         summarize(targets[t].name, "fresh_construct", freshOpen, raw, summary);
@@ -374,6 +391,9 @@ static int bench(const QString &iniPath, const QString &dbPath, const QString &o
         summarize(targets[t].name, "fresh_second_value", freshSecond, raw, summary);
         summarize(targets[t].name, "fresh_miss", freshMiss, raw, summary);
         summarize(targets[t].name, "fresh_contains", freshContains, raw, summary);
+        summarize(targets[t].name, "fresh_childKeys", freshChildKeys, raw, summary);
+        summarize(targets[t].name, "fresh_childGroups", freshChildGroups, raw, summary);
+        summarize(targets[t].name, "fresh_allKeys", freshAllKeys, raw, summary);
 
         QSettings *live = openBackend(targets[t].path, targets[t].qsdb);
         std::vector<uint64_t> reuse;
@@ -385,7 +405,7 @@ static int bench(const QString &iniPath, const QString &dbPath, const QString &o
             reuse.push_back(b - a);
         }
         summarize(targets[t].name, "reuse_construct", reuse, raw, summary);
-        live->value(hitKey);
+        live->allKeys();
 
         std::vector<uint64_t> hit, miss, contains;
         unsigned seed = 20261110u;
@@ -423,30 +443,36 @@ static int bench(const QString &iniPath, const QString &dbPath, const QString &o
             allKeys.push_back(d - c);
             syncNoop.push_back(e - d);
         }
-        summarize(targets[t].name, "childKeys", childKeys, raw, summary);
-        summarize(targets[t].name, "childGroups", childGroups, raw, summary);
-        summarize(targets[t].name, "allKeys", allKeys, raw, summary);
+        summarize(targets[t].name, "warm_childKeys", childKeys, raw, summary);
+        summarize(targets[t].name, "warm_childGroups", childGroups, raw, summary);
+        summarize(targets[t].name, "warm_allKeys", allKeys, raw, summary);
         summarize(targets[t].name, "sync_noop", syncNoop, raw, summary);
 
         std::vector<uint64_t> pureSet, rmw, pureNew;
         for (int i = 0; i < 21; ++i) {
+            const QString existing = keys.at(i);
             const uint64_t a = mono();
-            live->setValue(hitKey, QStringLiteral("bench-pure"));
+            live->setValue(existing, QStringLiteral("bench-pure"));
             const uint64_t b = mono();
             pureSet.push_back(b - a);
+        }
+        for (int i = 0; i < 21; ++i) {
+            const QString existing = keys.at(21 + i);
             const uint64_t c = mono();
-            const QString cur = live->value(hitKey).toString();
-            live->setValue(hitKey, cur);
+            const QString cur = live->value(existing).toString();
+            live->setValue(existing, cur);
             const uint64_t d = mono();
             rmw.push_back(d - c);
+        }
+        for (int i = 0; i < 21; ++i) {
             const uint64_t e = mono();
             live->setValue(QStringLiteral("bench-new-%1").arg(i), i);
             const uint64_t f = mono();
             pureNew.push_back(f - e);
         }
-        summarize(targets[t].name, "pure_set_existing", pureSet, raw, summary);
-        summarize(targets[t].name, "rmw_set_existing", rmw, raw, summary);
-        summarize(targets[t].name, "pure_set_new", pureNew, raw, summary);
+        summarize(targets[t].name, "pure_set_existing_uncommitted", pureSet, raw, summary);
+        summarize(targets[t].name, "rmw_committed_hot", rmw, raw, summary);
+        summarize(targets[t].name, "pure_set_new_uncommitted", pureNew, raw, summary);
         delete live;
 
         std::vector<uint64_t> oneSet, oneSync, batchEach, batchSync;

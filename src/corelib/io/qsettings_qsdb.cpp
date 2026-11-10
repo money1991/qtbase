@@ -86,6 +86,48 @@ static QString keyFromBytes(const void *data, size_t len)
     return s;
 }
 
+static QString utf16Slice(const uchar *p, int from, int count)
+{
+    QString s(count, Qt::Uninitialized);
+    for (int i = 0; i < count; ++i) {
+        const int o = (from + i) * 2;
+        s[i] = QChar(ushort(p[o] | (p[o + 1] << 8)));
+    }
+    return s;
+}
+
+static bool sameSlice(const QString &prev, const uchar *p, int from, int count)
+{
+    if (prev.size() != count)
+        return false;
+    for (int i = 0; i < count; ++i) {
+        const int o = (from + i) * 2;
+        if (prev.at(i).unicode() != ushort(p[o] | (p[o + 1] << 8)))
+            return false;
+    }
+    return true;
+}
+
+/* Exclusive upper bound of a UTF-16LE prefix. Empty means unbounded. */
+static QByteArray exclusiveEnd(const QByteArray &start)
+{
+    if (start.size() < 2 || (start.size() % 2) != 0)
+        return QByteArray();
+    QByteArray end = start;
+    for (int u = end.size() - 2; u >= 0; u -= 2) {
+        unsigned c = uchar(end[u]) | (unsigned(uchar(end[u + 1])) << 8);
+        if (c != 0xffffu) {
+            ++c;
+            end[u] = char(c & 0xff);
+            end[u + 1] = char((c >> 8) & 0xff);
+            return end;
+        }
+        end[u] = 0;
+        end[u + 1] = 0;
+    }
+    return QByteArray();
+}
+
 static bool containsUserType(const QVariant &v)
 {
     if (v.userType() >= QMetaType::User)
@@ -401,6 +443,54 @@ public:
 
     QStringList children(const QString &prefix, ChildSpec spec) const override
     {
+        if (stores.size() == 1) {
+            QsdbShared *shared = stores.at(0);
+            QMutexLocker lock(&shared->mu);
+            if (shared->snap && !shared->cleared && shared->added.isEmpty() && shared->removed.isEmpty()) {
+                struct Fast {
+                    int startChars;
+                    int spec;
+                    QStringList out;
+                    QString lastGroup;
+                    static int cb(const void *key, size_t keyLen, uint32_t, uint64_t, void *user)
+                    {
+                        Fast *f = static_cast<Fast *>(user);
+                        if ((keyLen % 2) != 0 || int(keyLen / 2) < f->startChars)
+                            return 0;
+                        const uchar *p = static_cast<const uchar *>(key);
+                        const int nchars = int(keyLen / 2);
+                        const int rel = nchars - f->startChars;
+                        int slash = -1;
+                        for (int i = 0; i < rel; ++i) {
+                            const int o = (f->startChars + i) * 2;
+                            if (ushort(p[o] | (p[o + 1] << 8)) == '/') {
+                                slash = i;
+                                break;
+                            }
+                        }
+                        if (f->spec == int(AllKeys)) {
+                            f->out.append(utf16Slice(p, f->startChars, rel));
+                        } else if (f->spec == int(ChildKeys)) {
+                            if (slash < 0)
+                                f->out.append(utf16Slice(p, f->startChars, rel));
+                        } else if (slash >= 0 && !sameSlice(f->lastGroup, p, f->startChars, slash)) {
+                            f->lastGroup = utf16Slice(p, f->startChars, slash);
+                            f->out.append(f->lastGroup);
+                        }
+                        return 0;
+                    }
+                } fast;
+                fast.startChars = prefix.size();
+                fast.spec = int(spec);
+                const QByteArray start = prefix.isEmpty() ? QByteArray() : keyBytes(prefix);
+                const QByteArray end = exclusiveEnd(start);
+                qsdb_scan_range(shared->snap, start.isEmpty() ? 0 : start.constData(),
+                                size_t(start.size()),
+                                end.isEmpty() ? 0 : end.constData(), size_t(end.size()),
+                                Fast::cb, &fast);
+                return fast.out;
+            }
+        }
         QMap<QString, int> merged;
         for (int i = stores.size() - 1; i >= 0; --i) {
             QsdbShared *shared = stores.at(i);
@@ -424,23 +514,7 @@ public:
                 } acc;
                 acc.prefix = prefix;
                 const QByteArray start = prefix.isEmpty() ? QByteArray() : keyBytes(prefix);
-                QByteArray end;
-                if (!start.isEmpty() && start.size() >= 2 && (start.size() % 2) == 0) {
-                    end = start;
-                    for (int u = end.size() - 2; u >= 0; u -= 2) {
-                        unsigned c = uchar(end[u]) | (unsigned(uchar(end[u + 1])) << 8);
-                        if (c != 0xffffu) {
-                            ++c;
-                            end[u] = char(c & 0xff);
-                            end[u + 1] = char((c >> 8) & 0xff);
-                            break;
-                        }
-                        end[u] = 0;
-                        end[u + 1] = 0;
-                        if (u == 0)
-                            end.clear();
-                    }
-                }
+                const QByteArray end = exclusiveEnd(start);
                 qsdb_scan_range(shared->snap, start.isEmpty() ? 0 : start.constData(),
                                 size_t(start.size()),
                                 end.isEmpty() ? 0 : end.constData(), size_t(end.size()),

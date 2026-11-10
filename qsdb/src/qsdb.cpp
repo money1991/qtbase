@@ -351,7 +351,13 @@ int os_pwrite(OsFile *f, const void *buf, uint32_t n, uint64_t off)
 
 int os_fsync(OsFile *f)
 {
-    return ::fsync(f->fd) == 0 ? QSDB_OK : io_err();
+    for (;;) {
+        if (::fsync(f->fd) == 0)
+            return QSDB_OK;
+        if (errno == EINTR)
+            continue;
+        return io_err();
+    }
 }
 
 int os_truncate(OsFile *f, uint64_t size)
@@ -370,7 +376,15 @@ int os_size(OsFile *f, uint64_t *out)
 
 int os_lock(OsFile *f)
 {
-    while (flock(f->fd, LOCK_EX) != 0) {
+    /* fcntl locks belong to the process. A child created by fork does not
+     * inherit them, so it cannot share the parent's exclusion the way flock
+     * would. Closing any descriptor of this file in this process drops the
+     * lock; keep a single qsdb handle open for the whole transaction. */
+    struct flock fl;
+    memset(&fl, 0, sizeof fl);
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    while (fcntl(f->fd, F_SETLKW, &fl) != 0) {
         if (errno == EINTR)
             continue;
         return io_err();
@@ -380,7 +394,15 @@ int os_lock(OsFile *f)
 
 void os_unlock(OsFile *f)
 {
-    flock(f->fd, LOCK_UN);
+    struct flock fl;
+    memset(&fl, 0, sizeof fl);
+    fl.l_type = F_UNLCK;
+    fl.l_whence = SEEK_SET;
+    while (fcntl(f->fd, F_SETLK, &fl) != 0) {
+        if (errno == EINTR)
+            continue;
+        break;
+    }
 }
 
 int os_fsync_dir(const std::string &path)
@@ -392,7 +414,17 @@ int os_fsync_dir(const std::string &path)
     int d = ::open(dir.c_str(), O_RDONLY | O_CLOEXEC);
     if (d < 0)
         return io_err();
-    int rc = ::fsync(d) == 0 ? QSDB_OK : io_err();
+    int rc = QSDB_IO;
+    for (;;) {
+        if (::fsync(d) == 0) {
+            rc = QSDB_OK;
+            break;
+        }
+        if (errno == EINTR)
+            continue;
+        rc = io_err();
+        break;
+    }
     ::close(d);
     return rc;
 }
@@ -428,6 +460,9 @@ struct qsdb {
     bool writing = false;
     bool readonly = false;
     uint32_t create_cmp = kCmpBytes;
+    uint64_t published_hw = 0;
+    uint64_t reserved_hw = 0;
+    int fsync_eintr_left = 0;
     std::vector<MapWin> maps;
     std::vector<uint8_t> crc_ok;
 #if defined(_WIN32)
@@ -455,6 +490,7 @@ struct qsdb_write {
     uint64_t base_physical;
     uint32_t cmp;
     bool active;
+    int error;
 };
 
 namespace {
@@ -544,6 +580,17 @@ int read_meta_slot(qsdb *db, int slot, Meta *out)
     return QSDB_OK;
 }
 
+bool meta_fits_file(const Meta &m, uint64_t file_bytes)
+{
+    if (m.high_water < 3 || m.high_water > (UINT64_MAX / kPage))
+        return false;
+    if (m.high_water * kPage > file_bytes)
+        return false;
+    if (m.root == 0 || m.root >= m.high_water)
+        return false;
+    return true;
+}
+
 int load_best_meta(qsdb *db, Meta *out)
 {
     Meta a, b;
@@ -553,12 +600,23 @@ int load_best_meta(qsdb *db, Meta *out)
     bool vb = rb == QSDB_OK;
     if (!va && !vb)
         return ra == QSDB_MISMATCH || rb == QSDB_MISMATCH ? QSDB_MISMATCH : QSDB_CORRUPT;
+    uint64_t sz = 0;
+    int src = os_size(&db->file, &sz);
+    if (src)
+        return src;
+    if (va && !meta_fits_file(a, sz))
+        return QSDB_CORRUPT;
+    if (vb && !meta_fits_file(b, sz))
+        return QSDB_CORRUPT;
     if (va && vb)
         *out = (a.generation >= b.generation) ? a : b;
     else
         *out = va ? a : b;
     return QSDB_OK;
 }
+
+void map_lock(qsdb *db);
+void map_unlock(qsdb *db);
 
 int ensure_physical(qsdb *db, uint64_t need)
 {
@@ -579,7 +637,9 @@ int ensure_physical(qsdb *db, uint64_t need)
     int rc = os_truncate(&db->file, target);
     if (rc)
         return rc;
+    map_lock(db);
     db->physical = target;
+    map_unlock(db);
     return QSDB_OK;
 }
 
@@ -655,9 +715,26 @@ int refresh_size(qsdb *db)
     int rc = os_size(&db->file, &sz);
     if (rc)
         return rc;
+    map_lock(db);
     if (sz > db->physical)
         db->physical = sz;
+    map_unlock(db);
     return QSDB_OK;
+}
+
+uint64_t published_of(qsdb *db)
+{
+    map_lock(db);
+    uint64_t h = db->published_hw;
+    map_unlock(db);
+    return h;
+}
+
+void note_published(qsdb *db, uint64_t hw)
+{
+    map_lock(db);
+    db->published_hw = hw;
+    map_unlock(db);
 }
 
 int map_complete_window(qsdb *db, uint64_t win)
@@ -717,13 +794,14 @@ int verify_tree_page(qsdb *db, uint64_t id, const uint8_t *p)
         return QSDB_CORRUPT;
     /* Only pages published by a commit are immutable. A page allocated in
      * the current transaction can be rewritten, so it must not be cached. */
-    if (id < db->committed.high_water) {
-        map_lock(db);
+    map_lock(db);
+    bool immutable = id < db->published_hw;
+    if (immutable) {
         if (db->crc_ok.size() <= id)
             db->crc_ok.resize(static_cast<size_t>(id) + 1, 0);
         db->crc_ok[static_cast<size_t>(id)] = 1;
-        map_unlock(db);
     }
+    map_unlock(db);
     return QSDB_OK;
 }
 
@@ -731,16 +809,42 @@ int view_page(qsdb *db, uint64_t id, uint64_t hw_limit, const uint8_t **out, Pag
 {
     if (id < 2 || id >= hw_limit)
         return QSDB_CORRUPT;
+    uint64_t win = id / kWinPages;
+    map_lock(db);
+    bool cached = id < db->crc_ok.size() && db->crc_ok[static_cast<size_t>(id)];
+    const uint8_t *mapped = 0;
+    if (win < db->maps.size() && db->maps[static_cast<size_t>(win)].addr) {
+        uint64_t within = id - win * kWinPages;
+        if (within < db->maps[static_cast<size_t>(win)].pages)
+            mapped = db->maps[static_cast<size_t>(win)].addr + within * kPage;
+    }
+    uint64_t published = db->published_hw;
+    uint64_t phys = db->physical;
+    map_unlock(db);
+    /* A cached page is immutable and already checksummed. The pointer was
+     * copied while the map table lock was held; abort unmaps only windows
+     * past the published prefix, which this id is not in. */
+    if (cached && mapped) {
+        *out = mapped;
+        return QSDB_OK;
+    }
     uint64_t need = (id + 1) * kPage;
-    if (need > db->physical) {
+    if (need > phys) {
         int rc = refresh_size(db);
         if (rc)
             return rc;
-        if (need > db->physical)
+        map_lock(db);
+        phys = db->physical;
+        published = db->published_hw;
+        map_unlock(db);
+        if (need > phys)
             return QSDB_CORRUPT;
     }
-    uint64_t win = id / kWinPages;
-    bool complete = (win + 1) * kWinPages * kPage <= db->physical;
+    /* Only a window that sits entirely inside the published prefix is mapped.
+     * Pages allocated by an open transaction, or by an extent that a failed
+     * commit may still truncate, stay on pread. */
+    bool complete = (win + 1) * kWinPages <= published
+                    && (win + 1) * kWinPages * kPage <= phys;
     if (complete) {
         map_lock(db);
         int rc = map_complete_window(db, win);
@@ -2208,6 +2312,7 @@ int qsdb_open(const char *path, int flags, qsdb **out)
         db->committed.cmp = db->create_cmp;
         db->committed.slot = 0;
         db->committed.valid = true;
+        note_published(db, tx.hw);
         *out = db;
         return QSDB_OK;
     }
@@ -2222,6 +2327,7 @@ int qsdb_open(const char *path, int flags, qsdb **out)
         return QSDB_MISMATCH;
     }
     db->committed = m;
+    note_published(db, m.high_water);
     *out = db;
     return QSDB_OK;
 }
@@ -2421,20 +2527,33 @@ int qsdb_begin_write(qsdb *db, qsdb_write **out)
     }
     uint64_t phys = 0;
     os_size(&db->file, &phys);
+    map_lock(db);
     db->physical = phys;
+    map_unlock(db);
     db->committed = m;
+    note_published(db, m.high_water);
     db->writing = true;
+    uint64_t hw = m.high_water;
+    if (db->reserved_hw > hw)
+        hw = db->reserved_hw;
     qsdb_write *tx = new qsdb_write();
     tx->db = db;
     tx->root = m.root;
-    tx->hw = m.high_water;
-    tx->base_hw = m.high_water;
+    tx->hw = hw;
+    tx->base_hw = hw;
     tx->nkeys = m.nkeys;
     tx->base_physical = phys;
     tx->cmp = m.cmp;
     tx->active = true;
+    tx->error = 0;
     *out = tx;
     return QSDB_OK;
+}
+
+static void poison(qsdb_write *tx, int rc)
+{
+    if (tx && rc && rc != QSDB_NOT_FOUND && tx->error == 0)
+        tx->error = rc;
 }
 
 static int put_raw(qsdb_write *tx, const void *key, size_t key_len, uint32_t tag,
@@ -2442,6 +2561,8 @@ static int put_raw(qsdb_write *tx, const void *key, size_t key_len, uint32_t tag
 {
     if (!tx || !tx->active || !key || key_len == 0 || key_len > QSDB_MAX_KEY_BYTES)
         return QSDB_INVAL;
+    if (tx->error)
+        return tx->error;
     if (val_len > QSDB_MAX_VALUE_BYTES)
         return QSDB_TOO_BIG;
     if (val_len && !val)
@@ -2449,28 +2570,37 @@ static int put_raw(qsdb_write *tx, const void *key, size_t key_len, uint32_t tag
     Ins r = insert_page(tx, tx->root, static_cast<const uint8_t *>(key),
                         static_cast<uint32_t>(key_len), tag,
                         static_cast<const uint8_t *>(val), static_cast<uint32_t>(val_len));
-    if (is_err(r))
+    if (is_err(r)) {
+        poison(tx, static_cast<int>(r.right));
         return static_cast<int>(r.right);
-    tx->root = r.page;
-    if (r.split) {
-        int arc = 0;
-        uint64_t id = alloc_page(tx, &arc);
-        if (arc)
-            return arc;
-        Item sep;
-        sep.key = r.sep;
-        sep.child = r.right;
-        std::vector<Item> seps(1, sep);
-        uint64_t right = 0;
-        std::vector<uint8_t> up;
-        uint64_t dummy = 0;
-        int rc = pack_internal(tx, r.page, seps, id, &right, &up, &dummy);
-        if (rc)
-            return rc;
-        if (right)
-            return QSDB_INVAL;
-        tx->root = id;
     }
+    if (!r.split) {
+        tx->root = r.page;
+        return QSDB_OK;
+    }
+    /* The previous root is unchanged until the parent that points at both
+     * halves is durable inside this transaction. A failure here must not
+     * publish only the left half. */
+    int arc = 0;
+    uint64_t id = alloc_page(tx, &arc);
+    if (arc) {
+        poison(tx, arc);
+        return arc;
+    }
+    Item sep;
+    sep.key = r.sep;
+    sep.child = r.right;
+    std::vector<Item> seps(1, sep);
+    uint64_t right = 0;
+    std::vector<uint8_t> up;
+    uint64_t dummy = 0;
+    int rc = pack_internal(tx, r.page, seps, id, &right, &up, &dummy);
+    if (rc || right) {
+        int err = rc ? rc : QSDB_INVAL;
+        poison(tx, err);
+        return err;
+    }
+    tx->root = id;
     return QSDB_OK;
 }
 
@@ -2486,8 +2616,10 @@ int qsdb_erase(qsdb_write *tx, const void *key, size_t key_len)
         return QSDB_INVAL;
     Del d = delete_page(tx, tx->root, static_cast<const uint8_t *>(key),
                         static_cast<uint32_t>(key_len), true);
-    if (del_err(d))
+    if (del_err(d)) {
+        poison(tx, static_cast<int>(d.page));
         return static_cast<int>(d.page);
+    }
     if (!d.changed)
         return QSDB_NOT_FOUND;
     if (!d.gone)
@@ -2521,11 +2653,15 @@ int qsdb_erase_tree(qsdb_write *tx, const void *key, size_t key_len,
         return QSDB_TOO_BIG;
     const uint8_t *kb = static_cast<const uint8_t *>(key);
     Del exact = delete_page(tx, tx->root, kb, static_cast<uint32_t>(key_len), true);
-    if (del_err(exact))
+    if (del_err(exact)) {
+        poison(tx, static_cast<int>(exact.page));
         return static_cast<int>(exact.page);
+    }
     int rc = adopt_root(tx, exact.page, exact.changed, exact.gone);
-    if (rc)
+    if (rc) {
+        poison(tx, rc);
         return rc;
+    }
     std::vector<uint8_t> lo;
     lo.reserve(key_len + sep_len);
     lo.insert(lo.end(), kb, kb + key_len);
@@ -2535,11 +2671,15 @@ int qsdb_erase_tree(qsdb_write *tx, const void *key, size_t key_len,
     RDel range = range_delete(tx, tx->root, lo.data(), static_cast<uint32_t>(lo.size()),
                               has_hi ? hi.data() : 0, has_hi ? static_cast<uint32_t>(hi.size()) : 0,
                               true, has_hi, true);
-    if (range.err)
+    if (range.err) {
+        poison(tx, range.err);
         return range.err;
+    }
     rc = adopt_root(tx, range.page, range.changed, range.gone);
-    if (rc)
+    if (rc) {
+        poison(tx, rc);
         return rc;
+    }
     if (!exact.changed && range.removed == 0)
         return QSDB_NOT_FOUND;
     return QSDB_OK;
@@ -2558,11 +2698,32 @@ int qsdb_clear(qsdb_write *tx)
     return QSDB_OK;
 }
 
+static int fsync_file(qsdb *db)
+{
+    for (;;) {
+        if (db->fsync_eintr_left > 0) {
+            db->fsync_eintr_left--;
+            continue;
+        }
+        return os_fsync(&db->file);
+    }
+}
+
+static void remember_reserved(qsdb *db, uint64_t hw)
+{
+    if (hw > db->reserved_hw)
+        db->reserved_hw = hw;
+}
+
 int qsdb_commit(qsdb_write *tx)
 {
     if (!tx || !tx->active)
         return QSDB_INVAL;
     qsdb *db = tx->db;
+    if (tx->error)
+        return tx->error;
+    if (db->committed.generation == UINT64_MAX)
+        return QSDB_INVAL;
     int crash = db->crash_phase;
     if (crash == QSDB_CRASH_AFTER_PAGES)
         _exit(42);
@@ -2570,11 +2731,13 @@ int qsdb_commit(qsdb_write *tx)
     if (db->fail_fsync == 1)
         rc = QSDB_IO;
     else
-        rc = os_fsync(&db->file);
+        rc = fsync_file(db);
     if (rc) {
         unmap_beyond(db, tx->base_physical);
         os_truncate(&db->file, tx->base_physical);
+        map_lock(db);
         db->physical = tx->base_physical;
+        map_unlock(db);
         tx->active = false;
         delete tx;
         db->writing = false;
@@ -2606,16 +2769,7 @@ int qsdb_commit(qsdb_write *tx)
     }
     rc = os_pwrite(&db->file, meta.b, kPage, static_cast<uint64_t>(slot) * kPage);
     if (rc) {
-        tx->active = false;
-        delete tx;
-        db->writing = false;
-        os_unlock(&db->file);
-#if !defined(_WIN32)
-        pthread_mutex_unlock(&db->mu);
-#endif
-        return rc;
-    }
-    if (db->fail_fsync == 2) {
+        remember_reserved(db, tx->hw);
         tx->active = false;
         delete tx;
         db->writing = false;
@@ -2625,8 +2779,35 @@ int qsdb_commit(qsdb_write *tx)
 #endif
         return QSDB_UNCERTAIN;
     }
-    rc = os_fsync(&db->file);
+    Page back;
+    int brc = os_pread(&db->file, back.b, kPage, static_cast<uint64_t>(slot) * kPage);
+    if (brc || memcmp(back.b, meta.b, kPage) != 0) {
+        memset(back.b, 0, sizeof back.b);
+        os_pwrite(&db->file, back.b, kPage, static_cast<uint64_t>(slot) * kPage);
+        remember_reserved(db, tx->hw);
+        tx->active = false;
+        delete tx;
+        db->writing = false;
+        os_unlock(&db->file);
+#if !defined(_WIN32)
+        pthread_mutex_unlock(&db->mu);
+#endif
+        return QSDB_IO;
+    }
+    if (db->fail_fsync == 2) {
+        remember_reserved(db, tx->hw);
+        tx->active = false;
+        delete tx;
+        db->writing = false;
+        os_unlock(&db->file);
+#if !defined(_WIN32)
+        pthread_mutex_unlock(&db->mu);
+#endif
+        return QSDB_UNCERTAIN;
+    }
+    rc = fsync_file(db);
     if (rc) {
+        remember_reserved(db, tx->hw);
         tx->active = false;
         delete tx;
         db->writing = false;
@@ -2645,6 +2826,9 @@ int qsdb_commit(qsdb_write *tx)
     db->committed.cmp = tx->cmp;
     db->committed.slot = slot;
     db->committed.valid = true;
+    note_published(db, tx->hw);
+    if (db->reserved_hw <= tx->hw)
+        db->reserved_hw = 0;
     tx->active = false;
     delete tx;
     db->writing = false;
@@ -2662,7 +2846,9 @@ void qsdb_abort(qsdb_write *tx)
     qsdb *db = tx->db;
     unmap_beyond(db, tx->base_physical);
     os_truncate(&db->file, tx->base_physical);
+    map_lock(db);
     db->physical = tx->base_physical;
+    map_unlock(db);
     tx->active = false;
     delete tx;
     db->writing = false;
@@ -2688,6 +2874,18 @@ void qsdb_debug_max_bytes(qsdb *db, uint64_t bytes)
 {
     if (db)
         db->max_bytes = bytes;
+}
+
+void qsdb_debug_eintr_fsync(qsdb *db, int times)
+{
+    if (db && times > 0)
+        db->fsync_eintr_left = times;
+}
+
+void qsdb_debug_force_generation(qsdb *db, uint64_t generation)
+{
+    if (db)
+        db->committed.generation = generation;
 }
 
 uint64_t qsdb_debug_root(qsdb *db)
